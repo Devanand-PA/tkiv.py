@@ -1,5 +1,8 @@
-# Purpose
+# Tkiv.py
 
-The purpose of this project is to merge two python scripts (in the references directory) into one single program.
-It is an image viewer with a dmenu mode , a listbox mode and a gallery mode.
-I need to rewrite the qt parts in tk.
+A slightly bloated image viewer and dmenu alternative written in python.
+
+<https://github.com/user-attachments/assets/812fb912-bd25-425a-804d-cdbec0fe7d8b>
+
+
+
