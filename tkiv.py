@@ -149,6 +149,12 @@ GALLERY_SIZE_QUANTUM  = 8
 GALLERY_OVERSCAN_ROWS = 2
 GALLERY_ZOOM_STEP     = 32
 
+# Aspect-ratio-aware tiles (mirrors sel_img.py behaviour)
+GALLERY_ASPECT_DEFAULT = 16.0 / 9.0
+GALLERY_ASPECT_MIN     = 0.4
+GALLERY_ASPECT_MAX     = 3.0
+GALLERY_ASPECT_SAMPLE  = 20
+
 # selector-only constants
 CACHE_SIZE = 800
 PRELOAD_AHEAD = 3
@@ -419,6 +425,9 @@ def _add_shared_ui_options(p, mode):
                    help='target number of gallery rows visible (default 3.5)')
     p.add_argument('--gallery-cols', type=int, default=None,
                    help='target number of gallery columns visible')
+    p.add_argument('--gallery-aspect', type=float, default=None,
+                   help='gallery tile width/height ratio (default: auto-detect '
+                        'from the images, e.g. 1.777 for 16:9)')
     p.add_argument('--lazy', action='store_true',
                    help='show UI immediately, populate as files are found')
     p.add_argument('-r', '--recursive', action='store_true',
@@ -448,7 +457,8 @@ def build_viewer_parser():
         prog=f"{PROGNAME} img", add_help=False, allow_abbrev=False,
         usage='%(prog)s [-abcgHhiopqrvZ0] [-A FRAMERATE] [-e WID] [-G GAMMA] '
               '[--geometry GEOMETRY] [-N NAME] [-n NUM] [-S DELAY] [-s MODE] '
-              '[-T SIZE] [--gallery-rows N] [--gallery-cols N] FILES...')
+              '[-T SIZE] [--gallery-rows N] [--gallery-cols N] '
+              '[--gallery-aspect N] FILES...')
     p.add_argument('-a', '--animate', action='store_true')
     p.add_argument('-A', '--framerate', type=int, default=0)
     p.add_argument('--assume-files', action='store_true')
@@ -605,6 +615,14 @@ class TkivApp:
         ts = getattr(opts, 'thumb_size', None)
         if ts and ts > 0:
             self._gallery_tile_override = ts
+
+        # Aspect-ratio-aware tile sizing
+        ga = getattr(opts, 'gallery_aspect', None)
+        self._gallery_aspect_opt = (float(ga)
+                                    if ga is not None and ga > 0 else None)
+        self._gallery_aspect_cache = None
+        self._orig_sizes = {}   # path -> (w, h), for aspect auto-detection
+
         self._tile_w = 240
         self._tile_h = 240
         self._tile_caption_h = 34
@@ -612,6 +630,11 @@ class TkivApp:
         self._tile_thumb_max = (self._tile_w - 5, self._tile_h - 5)
         self._pending_gallery_scroll = None
         self._gallery_redraw_pending = False
+
+        # Cached caption font metrics (monospace, so character count maps
+        # directly to pixel width).
+        self._caption_char_w = 1
+        self._caption_line_h = 1
 
         # List state
         self._list_photo = None
@@ -677,6 +700,11 @@ class TkivApp:
 
         self.bar_font = tkfont.Font(family='monospace', size=10)
         self.bar_height = self.bar_font.metrics('linespace') + 4
+
+        # Cache caption font metrics for the ellipsis/wrap logic.  The
+        # caption font is monospace, so character count maps to pixel width.
+        self._caption_char_w = max(1, self.bar_font.measure('M'))
+        self._caption_line_h = max(1, self.bar_font.metrics('linespace'))
 
         self.show_bar = (not getattr(self.opts, 'no_bar', False)
                          or getattr(self.opts, 'bar', False))
@@ -980,6 +1008,13 @@ class TkivApp:
         self.tns_thumbs.append(None)
         self._files_gen += 1
         self._rebuild_visible()
+
+        # Invalidate the aspect cache while we are still gathering the
+        # sample images (mirrors sel_img.py).
+        if (self._gallery_aspect_opt is None
+                and len(self.files) <= GALLERY_ASPECT_SAMPLE):
+            self._gallery_aspect_cache = None
+
         if len(self.files) == 1:
             self.fileidx = 0
             self._persist_index()
@@ -1375,25 +1410,95 @@ class TkivApp:
                                  self.img_y + iy0 * z,
                                  anchor='nw', image=self.tk_img)
 
+    # ---------------------------------------------------------- aspect detection
+    def _get_gallery_aspect(self):
+        """Return the tile aspect ratio (width / height).
+
+        When `--gallery-aspect` was supplied, use it directly.  Otherwise
+        sample the first GALLERY_ASPECT_SAMPLE files and take the median
+        aspect ratio, clamped to [GALLERY_ASPECT_MIN, GALLERY_ASPECT_MAX].
+        Mirrors sel_img.py's behaviour.
+        """
+        if self._gallery_aspect_cache is not None:
+            return self._gallery_aspect_cache
+
+        a = None
+        if self._gallery_aspect_opt is not None:
+            a = float(self._gallery_aspect_opt)
+        else:
+            ratios = []
+            for f in self.files[:GALLERY_ASPECT_SAMPLE]:
+                sz = self._orig_sizes.get(f.path)
+                if sz is None:
+                    sz = _get_orig_size(f.path)
+                    self._orig_sizes[f.path] = sz
+                w, h = sz
+                if w > 0 and h > 0:
+                    ratios.append(w / h)
+            if ratios:
+                ratios.sort()
+                a = ratios[len(ratios) // 2]
+
+        if a is None or a <= 0:
+            a = GALLERY_ASPECT_DEFAULT
+
+        a = max(GALLERY_ASPECT_MIN, min(GALLERY_ASPECT_MAX, a))
+        self._gallery_aspect_cache = a
+        return a
+
     # ---------------------------------------------------------- gallery rendering
     def _compute_tile_metrics(self):
+        """Return (tile_w, tile_h, caption_h, pad).
+
+        Tiles are no longer forced to be square: their aspect ratio is
+        derived from the gallery aspect (auto-detected or --gallery-aspect).
+        """
         cw = max(self.win_w, 1)
         ch = max(self.win_h, 1)
+        aspect = self._get_gallery_aspect()
+
         if self._gallery_tile_override is not None:
-            base = float(self._gallery_tile_override)
+            # `--gallery-tile-size` / Ctrl+zoom specifies the long side.
+            long_side = float(self._gallery_tile_override)
+            if aspect >= 1.0:
+                base_w = long_side
+                base_h = long_side / aspect
+            else:
+                base_h = long_side
+                base_w = long_side * aspect
         else:
-            candidates = []
             rows = self._gallery_rows_opt or GALLERY_TARGET_ROWS
-            candidates.append(ch / float(rows))
+            denom_v = 1.0 + GALLERY_CAPTION_RATIO + GALLERY_PAD_RATIO
+            tile_h_from_rows = (ch / float(rows)) / denom_v
+            tile_w_from_rows = tile_h_from_rows * aspect
+
             if self._gallery_cols_opt:
-                candidates.append(cw / float(self._gallery_cols_opt))
-            base = min(candidates)
+                denom_h = 1.0 + GALLERY_PAD_RATIO
+                tile_w_from_cols = (cw / float(self._gallery_cols_opt)) / denom_h
+                base_w = min(tile_w_from_rows, tile_w_from_cols)
+            else:
+                base_w = tile_w_from_rows
+            base_h = base_w / aspect
+
         q = GALLERY_SIZE_QUANTUM
-        tile = int(round(base / q)) * q
-        tile = max(GALLERY_TILE_MIN, min(GALLERY_TILE_MAX, tile))
-        pad = max(GALLERY_PAD_MIN, int(round(tile * GALLERY_PAD_RATIO)))
-        cap = max(GALLERY_CAPTION_MIN, int(round(tile * GALLERY_CAPTION_RATIO)))
-        return tile, tile, cap, pad
+        tile_w = int(round(base_w / q)) * q
+        tile_h = int(round(base_h / q)) * q
+        tile_w = max(q, tile_w)
+        tile_h = max(q, tile_h)
+
+        long_side = max(tile_w, tile_h)
+        if long_side < GALLERY_TILE_MIN:
+            scale = GALLERY_TILE_MIN / float(long_side)
+            tile_w = max(q, int(round(tile_w * scale / q)) * q)
+            tile_h = max(q, int(round(tile_h * scale / q)) * q)
+        elif long_side > GALLERY_TILE_MAX:
+            scale = GALLERY_TILE_MAX / float(long_side)
+            tile_w = max(q, int(round(tile_w * scale / q)) * q)
+            tile_h = max(q, int(round(tile_h * scale / q)) * q)
+
+        pad = max(GALLERY_PAD_MIN, int(round(tile_h * GALLERY_PAD_RATIO)))
+        cap = max(GALLERY_CAPTION_MIN, int(round(tile_h * GALLERY_CAPTION_RATIO)))
+        return tile_w, tile_h, cap, pad
 
     def _update_tile_metrics(self):
         tw, th, cap, pad = self._compute_tile_metrics()
@@ -1410,6 +1515,80 @@ class TkivApp:
     def _compute_gallery_cols(self):
         pad = self._tile_pad
         return max(1, (self.win_w - pad) // (self._tile_w + pad))
+
+    def _fit_caption(self, label, max_w, max_h):
+        """Return a (possibly multi-line) caption string that fits within
+        (max_w, max_h) pixels using the monospace caption font.
+
+        Tk's Canvas.create_text does not clip text, so we pre-wrap and
+        truncate here: over-long words are hard-broken, and if the label
+        cannot fit in the available lines, the last line is ended with an
+        ellipsis.  Because the caption font is monospace, character count
+        maps directly to pixel width.
+        """
+        char_w = self._caption_char_w
+        line_h = self._caption_line_h
+        if char_w <= 0 or line_h <= 0 or max_w <= 1 or max_h <= 1:
+            return label
+
+        cpl = max(1, int(max_w // char_w))        # chars per line
+        max_lines = max(1, int(max_h // line_h))  # lines we can draw
+        ell = '…'
+
+        if len(label) <= cpl:
+            return label
+
+        # Tokenise: split on whitespace, then hard-break over-long words.
+        tokens = []
+        for w in label.split():
+            while len(w) > cpl:
+                tokens.append(w[:cpl])
+                w = w[cpl:]
+            if w:
+                tokens.append(w)
+
+        lines = []
+        cur = ''
+        consumed = 0
+        truncated = False
+        for w in tokens:
+            if not cur:
+                cur = w
+                consumed += 1
+            elif len(cur) + 1 + len(w) <= cpl:
+                cur = cur + ' ' + w
+                consumed += 1
+            else:
+                lines.append(cur)
+                if len(lines) >= max_lines:
+                    truncated = True
+                    break
+                cur = w
+                consumed += 1
+
+        if not truncated:
+            if cur and len(lines) < max_lines:
+                lines.append(cur)
+            elif cur:
+                # No room for `cur` — need to truncate.
+                truncated = True
+
+        if not truncated and consumed >= len(tokens):
+            return '\n'.join(lines)
+
+        # Truncate the last retained line with an ellipsis.
+        if lines:
+            last = lines[-1]
+            if len(last) >= cpl:
+                lines[-1] = last[:cpl - 1] + ell
+            else:
+                lines[-1] = last + ell
+        elif cur:
+            lines.append(cur[:cpl - 1] + ell if len(cur) >= cpl else cur + ell)
+        else:
+            return ell
+
+        return '\n'.join(lines)
 
     def _submit_gallery_tile(self, i):
         if i < 0 or i >= len(self.files):
@@ -1466,8 +1645,6 @@ class TkivApp:
             return
         self.render_gallery()
         self.update_info()
-
-
 
     def _apply_gallery_scroll(self, index):
         if index < 0 or index >= len(self.files):
@@ -1578,12 +1755,15 @@ class TkivApp:
                     x + self._tile_w - 2,  y + self._tile_h - 2,
                     fill=self.mark_fg, outline=self.mark_fg)
 
-            label = self.files[abs_i].label
+            # Caption: pre-truncate/wrap so it never overflows the tile.
+            caption = self._fit_caption(
+                self.files[abs_i].label,
+                max(20, self._tile_w - 4),
+                max(1, self._tile_caption_h - 2))
             self.gallery_canvas.create_text(
                 x + self._tile_w // 2,
                 y + self._tile_h + self._tile_caption_h // 2,
-                text=label, fill=self.caption_fg,
-                width=max(20, self._tile_w - 4),
+                text=caption, fill=self.caption_fg,
                 anchor='center')
 
     def _gallery_hit(self, event_x, event_y):
@@ -1622,7 +1802,7 @@ class TkivApp:
         step = GALLERY_ZOOM_STEP * d
         base = (self._gallery_tile_override
                 if self._gallery_tile_override is not None
-                else self._tile_w)
+                else max(self._tile_w, self._tile_h))
         new_size = base + step
         new_size = max(GALLERY_TILE_MIN, min(GALLERY_TILE_MAX, new_size))
         if new_size == self._gallery_tile_override:
@@ -2340,6 +2520,8 @@ def run_viewer():
         print("  -T N,  --gallery-tile-size  gallery tile size in pixels")
         print("  --gallery-rows N            target rows visible")
         print("  --gallery-cols N            target cols visible")
+        print("  --gallery-aspect N          tile width/height ratio "
+              "(default: auto-detect)")
         print("  --lazy                      populate file list as it is scanned")
         return 0
 
