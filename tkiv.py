@@ -454,7 +454,7 @@ def build_viewer_parser():
     p.add_argument('--assume-files', action='store_true')
     p.add_argument('-b', '--no-bar', action='store_true')
     p.add_argument('--bar', action='store_true')
-    p.add_argument('--floating-window', action='store_true')
+    p.add_argument('--floating-window', dest='floating_window',action='store_true')
     p.add_argument('-c', '--clean-cache', action='store_true')
     p.add_argument('-e', '--embed', type=int, default=0)
     p.add_argument('-f', '--fullscreen', action='store_true')
@@ -611,6 +611,7 @@ class TkivApp:
         self._tile_pad = 10
         self._tile_thumb_max = (self._tile_w - 5, self._tile_h - 5)
         self._pending_gallery_scroll = None
+        self._gallery_redraw_pending = False
 
         # List state
         self._list_photo = None
@@ -623,6 +624,7 @@ class TkivApp:
 
         self._setup_ui()
         self._setup_bindings()
+        self._persist_index()
         self.root.after(50, self._initial_load)
         self.root.after(500, self._poll_autoreload)
         self.root.after(QUEUE_POLL_MS, self._poll_main_queue)
@@ -884,6 +886,7 @@ class TkivApp:
 
         if self._visible_indices and self.fileidx not in self._visible_indices:
             self.fileidx = self._visible_indices[0]
+            self._persist_index()
             if self.mode == MODE_IMAGE:
                 self.load_image_async(self.fileidx)
             else:
@@ -979,6 +982,7 @@ class TkivApp:
         self._rebuild_visible()
         if len(self.files) == 1:
             self.fileidx = 0
+            self._persist_index()
             if self.mode == MODE_IMAGE:
                 self.load_image_async(0)
             elif self.mode == MODE_GALLERY:
@@ -1062,6 +1066,7 @@ class TkivApp:
         self._img_in_flight.clear()
         self._gallery_in_flight.clear()
         self._rebuild_visible()
+        self._persist_index()
         return True
 
     # ---------------------------------------------------------- image load
@@ -1070,12 +1075,21 @@ class TkivApp:
             return
         self.alternate = self.fileidx
         self.fileidx = n
-        if getattr(self.opts, 'idx_write_path', None):
-            try:
-                with open(self.opts.idx_write_path, 'w') as fh:
-                    fh.write(str(n))
-            except Exception:
-                pass
+
+    def _persist_index(self):
+        """Write the current index to idx_write_path, if configured.
+
+        The value is 1-based, matching --start-at and the status bar.
+        Idempotent; failures are swallowed (debug interface).
+        """
+        path = getattr(self.opts, 'idx_write_path', None)
+        if not path:
+            return
+        try:
+            with open(path, 'w') as fh:
+                fh.write(str(self.fileidx + 1))
+        except Exception:
+            pass
 
     def _install_image(self, n, frames, delays):
         self.img_frames = frames
@@ -1124,6 +1138,7 @@ class TkivApp:
         self._load_token += 1
         self._set_current(n)
         self._install_image(n, frames, delays)
+        self._persist_index()
         return True
 
     def load_image_async(self, n):
@@ -1165,6 +1180,7 @@ class TkivApp:
                 self.redraw()
             return
         self._install_image(n, frames, delays)
+        self._persist_index()
         self.redraw()
         self._prefetch_neighbors(n)
 
@@ -1434,8 +1450,24 @@ class TkivApp:
             return
         self.tns_thumbs[i] = (ph, pil.size[0], pil.size[1])
         if self.mode == MODE_GALLERY:
-            self.render_gallery()
-            self.update_info()
+            self._schedule_gallery_redraw()
+
+    def _schedule_gallery_redraw(self):
+        """Coalesce many thumbnail-ready events into one redraw.
+        Runs as an idle task, so Tk processes buffered key events first."""
+        if self._gallery_redraw_pending:
+            return
+        self._gallery_redraw_pending = True
+        self.root.after_idle(self._do_gallery_redraw)
+
+    def _do_gallery_redraw(self):
+        self._gallery_redraw_pending = False
+        if self._quitting or self.mode != MODE_GALLERY:
+            return
+        self.render_gallery()
+        self.update_info()
+
+
 
     def _apply_gallery_scroll(self, index):
         if index < 0 or index >= len(self.files):
@@ -1640,6 +1672,7 @@ class TkivApp:
             new_idx = self._visible_indices[pos]
             if new_idx != self.fileidx:
                 self.fileidx = new_idx
+                self._persist_index()
                 try:
                     self._mtimes[new_idx] = os.path.getmtime(
                         self.files[new_idx].path)
@@ -1657,6 +1690,7 @@ class TkivApp:
 
         if self.fileidx not in self._visible_indices:
             self.fileidx = self._visible_indices[0]
+            self._persist_index()
         pos = self._visible_indices.index(self.fileidx)
         self.listbox.selection_clear(0, END)
         self.listbox.select_set(pos)
@@ -1814,9 +1848,9 @@ class TkivApp:
         if self.mode == MODE_IMAGE:
             self.load_image_async(n)
         else:
-            self._set_current(n) if n != self.fileidx else None
-            self.fileidx = n
+            self._set_current(n)
             self._pending_gallery_scroll = n
+            self._persist_index()
             self.redraw()
         return True
 
@@ -2207,10 +2241,12 @@ class TkivApp:
                         else:
                             self.fileidx = n
                             self._pending_gallery_scroll = n
+                            self._persist_index()
                             self.redraw()
                     else:
                         self.fileidx = n
                         self._pending_gallery_scroll = n
+                        self._persist_index()
                         self.redraw()
             elif button == 3:
                 n = self._gallery_hit(event.x, event.y)
@@ -2485,7 +2521,7 @@ def run_selector():
         sys.stderr.write(f"{PROGNAME}: cannot open display: {e}\n")
         sys.exit(1)
 
-    app = TkivApp(root, args, entries, purpose='select',enable_floating_window=args.floating_window)
+    app = TkivApp(root, args, entries, purpose='select')
     if args.lazy and scan_paths:
         app.start_lazy_scan(scan_paths, recursive=args.recursive,
                             sort_time=args.time)
