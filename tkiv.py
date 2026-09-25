@@ -94,9 +94,9 @@ THEME = {
 }
 
 
-# ============================================================ viewer constants
-VERSION  = "0.2.0"
-PROGNAME = "tkiv img"
+# ============================================================ constants
+VERSION  = "0.3.0"
+PROGNAME = "tkiv"
 
 SCALE_DOWN   = 'd'
 SCALE_FIT    = 'f'
@@ -149,13 +149,21 @@ GALLERY_SIZE_QUANTUM  = 8
 GALLERY_OVERSCAN_ROWS = 2
 GALLERY_ZOOM_STEP     = 32
 
+# selector-only constants
+CACHE_SIZE = 800
+PRELOAD_AHEAD = 3
+DECODE_WORKERS = max(2, min(8, os.cpu_count() or 4))
+DISK_CACHE_ENABLED = True
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "tkiv_thumbs"
+CACHE_WEBP_QUALITY = 82
 
-# ============================================================ viewer helpers
+
+# ============================================================ helpers
 def file_is_image(path):
     return os.path.splitext(path)[1].lower() in IMAGE_EXTS
 
 
-def collect_dir(d, recursive, include_hidden):
+def collect_dir(d, recursive, include_hidden, sort_time=False):
     out = []
     try:
         entries = sorted(os.listdir(d))
@@ -178,7 +186,13 @@ def collect_dir(d, recursive, include_hidden):
             out.append(full)
 
     for s in subdirs:
-        out.extend(collect_dir(s, recursive, include_hidden))
+        out.extend(collect_dir(s, recursive, include_hidden, sort_time))
+
+    if sort_time:
+        try:
+            out.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        except OSError:
+            pass
     return out
 
 
@@ -307,36 +321,94 @@ def load_gallery_thumb(path, max_w, max_h):
     return im
 
 
-# ============================================================ viewer parser
-def build_viewer_parser():
-    p = argparse.ArgumentParser(
-        prog=PROGNAME, add_help=False, allow_abbrev=False,
-        usage='%(prog)s [-abcgHhiopqrvZ0] [-A FRAMERATE] [-e WID] [-G GAMMA] '
-              '[--geometry GEOMETRY] [-N NAME] [-n NUM] [-S DELAY] [-s MODE] '
-              '[-T SIZE] [--gallery-rows N] [--gallery-cols N] FILES...',
-    )
-    p.add_argument('-a', '--animate', action='store_true')
-    p.add_argument('-A', '--framerate', type=int, default=0)
-    p.add_argument('--assume-files', action='store_true')
-    p.add_argument('-b', '--no-bar', action='store_true')
-    p.add_argument('--bar', action='store_true')
-    p.add_argument('-c', '--clean-cache', action='store_true')
-    p.add_argument('-e', '--embed', type=int, default=0)
-    p.add_argument('-f', '--fullscreen', action='store_true')
-    p.add_argument('-G', '--gamma', type=int, default=0)
-    p.add_argument('--geometry', default=None)
-    p.add_argument('-H', '--hidden', action='store_true')
-    p.add_argument('-h', '--help', action='store_true')
-    p.add_argument('-i', '--stdin', action='store_true', dest='from_stdin')
-    p.add_argument('-n', '--start-at', type=int, default=1)
-    p.add_argument('-N', '--name', default=None)
-    p.add_argument('--class', dest='class_', default=None)
-    p.add_argument('-o', '--stdout', action='store_true')
-    p.add_argument('-p', '--private', action='store_true', dest='private_mode')
-    p.add_argument('-q', '--quiet', action='store_true')
-    p.add_argument('-r', '--recursive', action='store_true')
-    p.add_argument('-S', '--ss-delay', type=float, default=0.0)
-    p.add_argument('-s', '--scale-mode', default='d')
+def _get_orig_size(path):
+    try:
+        with Image.open(path) as img:
+            return img.size
+    except Exception:
+        return (0, 0)
+
+
+def _disk_cache_path(path, w, h):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = hashlib.sha1(
+        f"{path}|{st.st_mtime_ns}|{st.st_size}|{w}x{h}".encode("utf-8")
+    ).hexdigest()
+    return CACHE_DIR / key[:2] / (key + ".webp")
+
+
+def _decode_thumb(path, max_w, max_h):
+    """Decode with disk cache (selector path)."""
+    orig_size = _get_orig_size(path)
+    cache_file = _disk_cache_path(path, max_w, max_h) if DISK_CACHE_ENABLED else None
+
+    if cache_file is not None and cache_file.exists():
+        try:
+            with Image.open(cache_file) as img:
+                img.load()
+                return img, orig_size
+        except Exception:
+            try:
+                cache_file.unlink()
+            except OSError:
+                pass
+
+    pil_img = None
+    if HAS_VIPS and HAS_NUMPY:
+        try:
+            v = pyvips.Image.thumbnail(path, max_w, height=max_h, size="down")
+            arr = v.numpy()
+            if v.bands == 4:
+                pil_img = Image.fromarray(arr.copy(), "RGBA")
+            elif v.bands == 3:
+                pil_img = Image.fromarray(arr.copy(), "RGB")
+            else:
+                pil_img = Image.fromarray(arr.copy()).convert("RGB")
+        except Exception:
+            pil_img = None
+
+    if pil_img is None:
+        try:
+            with Image.open(path) as img:
+                if img.format == "JPEG":
+                    img.draft("RGB", (max_w, max_h))
+                if img.width > max_w * 4 or img.height > max_h * 4:
+                    factor = max(1, min(img.width // (max_w * 2),
+                                        img.height // (max_h * 2)))
+                    if factor > 1:
+                        img = img.reduce(factor)
+                img.thumbnail((max_w, max_h),
+                              Image.Resampling.BILINEAR,
+                              reducing_gap=2.0)
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGBA" if "A" in img.mode else "RGB")
+                img.load()
+                pil_img = img
+        except Exception:
+            pil_img = None
+
+    if pil_img is not None and cache_file is not None:
+        tmp = None
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_file.with_name(cache_file.name + ".tmp")
+            pil_img.save(tmp, "WEBP", quality=CACHE_WEBP_QUALITY, method=0)
+            os.replace(tmp, cache_file)
+        except Exception:
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
+    return pil_img, orig_size
+
+
+# ============================================================ CLI
+def _add_shared_ui_options(p, mode):
+    """Options shared by both viewer and selector."""
     p.add_argument('-g', '-t', '--gallery', '--thumbnail',
                    action='store_true', dest='thumb_mode',
                    help='start in gallery mode')
@@ -347,7 +419,54 @@ def build_viewer_parser():
                    help='target number of gallery rows visible (default 3.5)')
     p.add_argument('--gallery-cols', type=int, default=None,
                    help='target number of gallery columns visible')
+    p.add_argument('--lazy', action='store_true',
+                   help='show UI immediately, populate as files are found')
+    p.add_argument('-r', '--recursive', action='store_true',
+                   help='search directories recursively')
+    p.add_argument('-H', '--hidden', action='store_true',
+                   help='include hidden files')
+    p.add_argument('--time', action='store_true',
+                   help='sort by modification time (newest first)')
+    p.add_argument('-n', '--start-at', '--pass-idx',
+                   type=int, default=1, dest='start_at',
+                   help='start at index N (1-based)')
+    p.add_argument('--name', '--custom-title', default=None, dest='name',
+                   help='window title')
+    p.add_argument('--idx-write-path', default=None,
+                   help='write current index to this file (debug)')
+    p.add_argument('--pre-select', default=None,
+                   help='newline-separated labels to pre-select at launch')
+    p.add_argument('--pre-select-file', default=None,
+                   help='file containing pre-select labels')
+    p.add_argument('-q', '--quiet', action='store_true')
     p.add_argument('-v', '--version', action='store_true')
+    p.add_argument('-h', '--help', action='store_true')
+
+
+def build_viewer_parser():
+    p = argparse.ArgumentParser(
+        prog=f"{PROGNAME} img", add_help=False, allow_abbrev=False,
+        usage='%(prog)s [-abcgHhiopqrvZ0] [-A FRAMERATE] [-e WID] [-G GAMMA] '
+              '[--geometry GEOMETRY] [-N NAME] [-n NUM] [-S DELAY] [-s MODE] '
+              '[-T SIZE] [--gallery-rows N] [--gallery-cols N] FILES...')
+    p.add_argument('-a', '--animate', action='store_true')
+    p.add_argument('-A', '--framerate', type=int, default=0)
+    p.add_argument('--assume-files', action='store_true')
+    p.add_argument('-b', '--no-bar', action='store_true')
+    p.add_argument('--bar', action='store_true')
+    p.add_argument('--floating-window', action='store_true')
+    p.add_argument('-c', '--clean-cache', action='store_true')
+    p.add_argument('-e', '--embed', type=int, default=0)
+    p.add_argument('-f', '--fullscreen', action='store_true')
+    p.add_argument('-G', '--gamma', type=int, default=0)
+    p.add_argument('--geometry', default=None)
+    p.add_argument('-i', '--stdin', action='store_true', dest='from_stdin')
+    p.add_argument('-N', '--legacy-name', default=None, dest='legacy_name')
+    p.add_argument('--class', dest='class_', default=None)
+    p.add_argument('-o', '--stdout', action='store_true')
+    p.add_argument('-p', '--private', action='store_true', dest='private_mode')
+    p.add_argument('-S', '--ss-delay', type=float, default=0.0)
+    p.add_argument('-s', '--scale-mode', default='d')
     p.add_argument('-z', '--zoom', type=int, default=0)
     p.add_argument('-Z', '--zoom-100', action='store_true')
     p.add_argument('-0', '--null', action='store_true', dest='using_null')
@@ -356,28 +475,70 @@ def build_viewer_parser():
     p.add_argument('--cache-allow', default=None)
     p.add_argument('--cache-deny',  default=None)
     p.add_argument('--update-cache', action='store_true')
+    _add_shared_ui_options(p, 'view')
     p.add_argument('files', nargs='*')
     return p
 
 
-# ============================================================ viewer app
+def build_selector_parser():
+    p = argparse.ArgumentParser(
+        prog=f"{PROGNAME} select", add_help=False, allow_abbrev=False,
+        description="Interactive image selector (dmenu-like)")
+    p.add_argument('--dmenu-mode', action='store_true',
+                   help='enable dmenu mode (list entries + image paths)')
+    p.add_argument('--list-file')
+    p.add_argument('--list-entries')
+    p.add_argument('--image-file')
+    p.add_argument('--image-entries')
+    p.add_argument('--return-label', action='store_true',
+                   help='output the list label instead of the image path')
+    _add_shared_ui_options(p, 'select')
+    p.add_argument('paths', nargs='*', default=['.'])
+    return p
+
+
+def _read_pre_select(args):
+    if args.pre_select and args.pre_select_file:
+        sys.stderr.write("Error: both --pre-select and --pre-select-file provided.\n")
+        sys.exit(1)
+    if args.pre_select_file:
+        try:
+            with open(args.pre_select_file, 'r') as f:
+                return [line.rstrip('\n') for line in f]
+        except Exception as e:
+            sys.stderr.write(f"Error reading pre-select file: {e}\n")
+            sys.exit(1)
+    if args.pre_select:
+        return args.pre_select.split('\n')
+    return None
+
+
+# ============================================================ file entry
 class FileEntry:
-    __slots__ = ('name', 'path', 'flags')
-    def __init__(self, name):
+    __slots__ = ('name', 'path', 'flags', 'label')
+    def __init__(self, name, label=None):
         self.name = name
         self.path = name
         self.flags = 0
+        self.label = label if label is not None else os.path.basename(name)
 
 
-class NSXIVApp:
-    def __init__(self, root, opts, files):
+# ============================================================ unified app
+class TkivApp:
+    """Unified viewer/selector app. `purpose` selects Enter behavior
+    and output-on-exit semantics."""
+
+    def __init__(self, root, opts, files, purpose='view',enable_floating_window=False):
+        self.purpose = purpose
+        self.enable_floating_window = enable_floating_window
         self.root = root
         self.opts = opts
-        self.files = [FileEntry(f) for f in files]
-        if not self.files:
+        self.files = list(files)
+        if not self.files and not getattr(opts, 'lazy', False):
             raise SystemExit("no files")
 
-        start = max(0, min(opts.start_at - 1, len(self.files) - 1))
+        start = max(0, min(getattr(opts, 'start_at', 1) - 1,
+                           max(0, len(self.files) - 1))) if self.files else 0
         self.fileidx   = start
         self.mode      = MODE_GALLERY if opts.thumb_mode else MODE_IMAGE
         self.markidx   = 0
@@ -386,6 +547,7 @@ class NSXIVApp:
         self._mtimes = {}
         self._resize_pending = False
         self._quitting = False
+        self._scan_cancel = False
 
         # Filtering
         self._filter_text = ""
@@ -406,25 +568,26 @@ class NSXIVApp:
         self.img_frames    = []
         self.img_delays    = []
         self.img_sel       = 0
-        self.img_animate   = opts.animate
+        self.img_animate   = getattr(opts, 'animate', False)
         self.img_multi_len = 0
         self.img_w = self.img_h = 0
         self.zoom = 1.0
-        self.scalemode = opts.scale_mode
+        self.scalemode = getattr(opts, 'scale_mode', SCALE_DOWN)
         self.img_x = self.img_y = 0.0
-        self.gamma = opts.gamma
+        self.gamma = getattr(opts, 'gamma', 0)
         self.brightness = 0
         self.contrast = 0
-        self.anti_alias = (opts.anti_alias != 'no')
-        self.alpha_layer = (opts.alpha_layer == 'yes')
+        self.anti_alias = (getattr(opts, 'anti_alias', 'yes') != 'no')
+        self.alpha_layer = (getattr(opts, 'alpha_layer', None) == 'yes')
 
-        if opts.zoom_100:
+        if getattr(opts, 'zoom_100', False):
             self.scalemode, self.zoom = SCALE_ZOOM, 1.0
-        elif opts.zoom > 0:
+        elif getattr(opts, 'zoom', 0) > 0:
             self.scalemode, self.zoom = SCALE_ZOOM, opts.zoom / 100.0
 
-        self.ss_on    = opts.ss_delay > 0
-        self.ss_delay = (int(opts.ss_delay * 10) if opts.ss_delay > 0
+        ss_delay = getattr(opts, 'ss_delay', 0.0)
+        self.ss_on    = ss_delay > 0
+        self.ss_delay = (int(ss_delay * 10) if ss_delay > 0
                          else SLIDESHOW_DELAY * 10)
 
         # Gallery state
@@ -433,14 +596,15 @@ class NSXIVApp:
         self._gallery_photos = []
         self._gallery_cols = 1
         self._gallery_rows_opt = (opts.gallery_rows
-                                  if opts.gallery_rows and opts.gallery_rows > 0
-                                  else None)
+                                  if getattr(opts, 'gallery_rows', None)
+                                  and opts.gallery_rows > 0 else None)
         self._gallery_cols_opt = (opts.gallery_cols
-                                  if opts.gallery_cols and opts.gallery_cols > 0
-                                  else None)
+                                  if getattr(opts, 'gallery_cols', None)
+                                  and opts.gallery_cols > 0 else None)
         self._gallery_tile_override = None
-        if opts.thumb_size and opts.thumb_size > 0:
-            self._gallery_tile_override = opts.thumb_size
+        ts = getattr(opts, 'thumb_size', None)
+        if ts and ts > 0:
+            self._gallery_tile_override = ts
         self._tile_w = 240
         self._tile_h = 240
         self._tile_caption_h = 34
@@ -451,13 +615,26 @@ class NSXIVApp:
         # List state
         self._list_photo = None
         self._list_pending = -1
-        self._list_last_rendered = -1
+
+        # Pre-select (labels)
+        pre_labels = _read_pre_select(opts) if hasattr(opts, 'pre_select') else None
+        if pre_labels:
+            self._apply_pre_select(pre_labels)
 
         self._setup_ui()
         self._setup_bindings()
         self.root.after(50, self._initial_load)
         self.root.after(500, self._poll_autoreload)
         self.root.after(QUEUE_POLL_MS, self._poll_main_queue)
+
+    # ---------------------------------------------------------- pre-select
+    def _apply_pre_select(self, labels):
+        target = set(labels)
+        matched = set()
+        for f in self.files:
+            if f.label in target and f.label not in matched:
+                f.flags |= FF_MARK
+                matched.add(f.label)
 
     # ---------------------------------------------------------- UI
     def _setup_ui(self):
@@ -469,7 +646,7 @@ class NSXIVApp:
         self.select_bg = THEME['selected_bg']
         self.select_fg = THEME['selected_fg']
 
-        if self.opts.geometry:
+        if getattr(self.opts, 'geometry', None):
             try:
                 self.root.geometry(self.opts.geometry)
             except Exception:
@@ -479,23 +656,37 @@ class NSXIVApp:
 
         self.root.title(self.opts.name or 'tkiv')
         self.root.configure(bg=self.bg)
-        if self.opts.fullscreen:
+
+        # Selector windows use the same floating/centred setup as sel_img:
+        # make the window a dialog, keep it above other windows, and give it
+        # a 50px margin on every side of the screen.
+        if (self.purpose == 'select') or self.enable_floating_window:
+            self.root.attributes('-topmost', True)
+            try:
+                self.root.attributes('-type', 'dialog')
+            except Exception:
+                pass
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            self.root.geometry(f'{sw - 100}x{sh - 100}+50+50')
+            self.root.minsize(600, 400)
+        elif getattr(self.opts, 'fullscreen', False):
             self.root.attributes('-fullscreen', True)
 
         self.bar_font = tkfont.Font(family='monospace', size=10)
         self.bar_height = self.bar_font.metrics('linespace') + 4
 
-        self.show_bar = (not self.opts.no_bar) or self.opts.bar
+        self.show_bar = (not getattr(self.opts, 'no_bar', False)
+                         or getattr(self.opts, 'bar', False))
 
-        # ---- content container ----
         self.content = tk.Frame(self.root, bg=self.bg)
         self.content.pack(side=TOP, fill=BOTH, expand=True)
 
-        # --- image canvas
+        # image canvas
         self.canvas = tk.Canvas(self.content, bg=self.bg,
                                 highlightthickness=0, takefocus=0)
 
-        # --- gallery frame (canvas + scrollbar)
+        # gallery
         self.gallery_frame = tk.Frame(self.content, bg=self.bg)
         self.gallery_canvas = tk.Canvas(self.gallery_frame, bg=self.bg,
                                         highlightthickness=0, takefocus=0)
@@ -510,7 +701,7 @@ class NSXIVApp:
         self.gallery_canvas.bind('<MouseWheel>', self._on_gallery_mousewheel)
         self.gallery_vsb.bind('<MouseWheel>', self._on_gallery_mousewheel)
 
-        # --- list frame (listbox + preview)
+        # list
         self.list_frame = tk.Frame(self.content, bg=self.bg)
         lf_left = tk.Frame(self.list_frame, bg=self.bg, width=300)
         lf_left.pack(side=LEFT, fill=Y, expand=False)
@@ -545,7 +736,7 @@ class NSXIVApp:
 
         self.listbox.bind('<<ListboxSelect>>', self._on_listbox_select)
 
-        # ---- status label + search bar (packed after content so they stick to bottom)
+        # status + search bar
         self.status = tk.Label(self.root, text='', anchor='w',
                                bg=self.bg, fg=self.fg,
                                font=self.bar_font, padx=8, pady=2)
@@ -564,7 +755,6 @@ class NSXIVApp:
             relief='flat', font=('sans-serif', 12))
         self.search_entry.pack(side=BOTTOM, fill=X, padx=4, pady=(2, 4))
 
-        # Show the right content frame
         self._show_content()
 
         self.root.update_idletasks()
@@ -590,14 +780,13 @@ class NSXIVApp:
             try:
                 fn()
             except Exception as e:
-                if not self.opts.quiet:
+                if not getattr(self.opts, 'quiet', False):
                     sys.stderr.write(f"{PROGNAME}: {e}\n")
             return "break"
         return handler
 
     def _setup_bindings(self):
         e = self.search_entry
-        # Navigation
         e.bind('<Up>',    self._mk_break(lambda: self._key_nav(DIR_UP)))
         e.bind('<Down>',  self._mk_break(lambda: self._key_nav(DIR_DOWN)))
         e.bind('<Left>',  self._mk_break(lambda: self._key_nav(DIR_LEFT)))
@@ -607,16 +796,14 @@ class NSXIVApp:
         e.bind('<Home>',  self._mk_break(self.act_first))
         e.bind('<End>',   self._mk_break(self.act_last))
 
-        # Mode / control
-        e.bind('<Tab>',       self._mk_break(lambda: self._cycle_mode(1)))
-        e.bind('<Shift-Tab>', self._mk_break(lambda: self._cycle_mode(-1)))
+        e.bind('<Tab>',          self._mk_break(lambda: self._cycle_mode(1)))
+        e.bind('<Shift-Tab>',    self._mk_break(lambda: self._cycle_mode(-1)))
         e.bind('<ISO_Left_Tab>', self._mk_break(lambda: self._cycle_mode(-1)))
-        e.bind('<Return>',    self._mk_break(self._key_return))
-        e.bind('<KP_Enter>',  self._mk_break(self._key_return))
-        e.bind('<Escape>',    self._mk_break(self._key_escape))
-        e.bind('<Delete>',    self._mk_break(self._key_delete))
+        e.bind('<Return>',       self._mk_break(self._key_return))
+        e.bind('<KP_Enter>',     self._mk_break(self._key_return))
+        e.bind('<Escape>',       self._mk_break(self._key_escape))
+        e.bind('<Delete>',       self._mk_break(self._key_delete))
 
-        # Ctrl actions
         ctrl_bindings = {
             'q':            self.quit,
             'b':            self.act_toggle_bar,
@@ -659,13 +846,15 @@ class NSXIVApp:
         for key, fn in ctrl_bindings.items():
             e.bind(f'<Control-{key}>', self._mk_break(fn))
 
+        # Ctrl+Enter = toggle mark (used especially in selector)
+        e.bind('<Control-Return>', self._mk_break(self.act_toggle_mark))
+
         # Shift+Ctrl variants
         e.bind('<Control-Shift-W>', self._mk_break(lambda: self.act_fit(SCALE_FIT)))
         e.bind('<Control-Shift-F>', self._mk_break(lambda: self.act_fit(SCALE_FILL)))
         e.bind('<Control-Shift-E>', self._mk_break(lambda: self.act_fit(SCALE_HEIGHT)))
         e.bind('<Control-Shift-I>', self._mk_break(self.act_toggle_alpha))
 
-        # Root-level bindings for mouse
         for b in (1, 2, 3, 4, 5):
             self.canvas.bind(f'<ButtonPress-{b}>',
                              lambda ev, btn=b: self.on_button(ev, btn))
@@ -674,18 +863,16 @@ class NSXIVApp:
 
         self.canvas.bind('<Configure>', self.on_configure)
         self.gallery_canvas.bind('<Configure>', self.on_configure, add='+')
-        self.root.protocol('WM_DELETE_WINDOW', lambda: self.quit(0))
+        self.root.protocol('WM_DELETE_WINDOW',
+                           lambda: self.quit(1 if self.purpose == 'select' else 0))
 
-        # Make sure typing anywhere focuses the search entry.
         self.root.bind('<KeyPress>', self._on_root_key)
         self.search_entry.focus_set()
 
     def _on_root_key(self, event):
-        # If the entry already has focus, do nothing (entry handles it).
         if self.root.focus_get() is self.search_entry:
             return
         self.search_entry.focus_set()
-        # Re-dispatch printable characters into the entry.
         if event.char and len(event.char) == 1 and event.char.isprintable():
             self.search_entry.insert(END, event.char)
             self.search_entry.icursor(END)
@@ -695,7 +882,6 @@ class NSXIVApp:
         self._filter_text = self.search_var.get()
         self._rebuild_visible()
 
-        # If current file isn't visible, jump to first match.
         if self._visible_indices and self.fileidx not in self._visible_indices:
             self.fileidx = self._visible_indices[0]
             if self.mode == MODE_IMAGE:
@@ -721,10 +907,12 @@ class NSXIVApp:
         else:
             self._visible_indices = [
                 i for i, f in enumerate(self.files)
-                if all(t in os.path.basename(f.name).lower() for t in terms)
+                if all(t in f.label.lower() or t in f.path.lower() for t in terms)
             ]
 
     def _initial_load(self):
+        if not self.files:
+            return
         if self.mode == MODE_IMAGE:
             self.load_image_async(self.fileidx)
         elif self.mode == MODE_GALLERY:
@@ -733,6 +921,77 @@ class NSXIVApp:
         else:
             self._populate_listbox()
             self.redraw()
+
+    # ---------------------------------------------------------- lazy scan
+    def start_lazy_scan(self, paths, recursive=False, sort_time=False):
+        def worker():
+            seen = set()
+            for path in paths:
+                if self._scan_cancel or self._quitting:
+                    return
+                p = Path(path).expanduser()
+                try:
+                    p = p.resolve()
+                except Exception:
+                    continue
+                if not p.exists():
+                    continue
+                if p.is_dir():
+                    pattern = "**/*" if recursive else "*"
+                    try:
+                        entries = list(p.glob(pattern))
+                    except Exception:
+                        continue
+                    if sort_time:
+                        try:
+                            entries = sorted(
+                                entries,
+                                key=lambda x: x.stat().st_mtime,
+                                reverse=True)
+                        except OSError:
+                            pass
+                    else:
+                        entries = sorted(entries)
+                    for f in entries:
+                        if self._scan_cancel or self._quitting:
+                            return
+                        if f.suffix.lower() in IMAGE_EXTS:
+                            sp = str(f)
+                            if sp in seen:
+                                continue
+                            seen.add(sp)
+                            self._post(lambda fp=sp: self._add_lazy_file(fp))
+                elif p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+                    sp = str(p)
+                    if sp in seen:
+                        continue
+                    seen.add(sp)
+                    self._post(lambda fp=sp: self._add_lazy_file(fp))
+        threading.Thread(target=worker, daemon=True,
+                         name='tkiv-scan').start()
+
+    def _add_lazy_file(self, path):
+        if self._quitting:
+            return
+        self.files.append(FileEntry(path))
+        self.tns_thumbs.append(None)
+        self._files_gen += 1
+        self._rebuild_visible()
+        if len(self.files) == 1:
+            self.fileidx = 0
+            if self.mode == MODE_IMAGE:
+                self.load_image_async(0)
+            elif self.mode == MODE_GALLERY:
+                self._pending_gallery_scroll = 0
+                self.redraw()
+            else:
+                self._populate_listbox()
+                self.redraw()
+        else:
+            if self.mode in (MODE_GALLERY, MODE_LIST):
+                self.redraw()
+            elif self.mode == MODE_IMAGE:
+                self._prefetch_neighbors(self.fileidx)
 
     # ---------------------------------------------------------- main-thread queue
     def _post(self, fn):
@@ -778,7 +1037,7 @@ class NSXIVApp:
         if n < 0 or n >= len(self.files):
             return False
         if len(self.files) == 1:
-            if not manual and not self.opts.quiet:
+            if not manual and not getattr(self.opts, 'quiet', False):
                 sys.stderr.write(f"{PROGNAME}: no more files to display, aborting\n")
             self.quit(0 if manual else 1)
             return False
@@ -811,6 +1070,12 @@ class NSXIVApp:
             return
         self.alternate = self.fileidx
         self.fileidx = n
+        if getattr(self.opts, 'idx_write_path', None):
+            try:
+                with open(self.opts.idx_write_path, 'w') as fh:
+                    fh.write(str(n))
+            except Exception:
+                pass
 
     def _install_image(self, n, frames, delays):
         self.img_frames = frames
@@ -842,8 +1107,12 @@ class NSXIVApp:
             try:
                 frames, delays = load_frames(path, max_dim=MAX_LOAD_DIM)
             except Exception as e:
-                if not self.opts.quiet:
+                if not getattr(self.opts, 'quiet', False):
                     sys.stderr.write(f"{PROGNAME}: {self.files[n].name}: {e}\n")
+                if getattr(self.opts, 'assume_files', False):
+                    self.img_frames = []
+                    self.img_w = self.img_h = 0
+                    return False
                 if not self.remove_file(n, False):
                     return False
                 if n >= len(self.files):
@@ -886,6 +1155,11 @@ class NSXIVApp:
         if n < 0 or n >= len(self.files):
             return
         if err is not None:
+            if getattr(self.opts, 'assume_files', False):
+                self.img_frames = []
+                self.img_w = self.img_h = 0
+                self.redraw()
+                return
             self.load_image(self.fileidx)
             if not self._quitting:
                 self.redraw()
@@ -916,7 +1190,6 @@ class NSXIVApp:
     def _prefetch_neighbors(self, n):
         if self.mode != MODE_IMAGE:
             return
-        # Only prefetch neighbors that are in the visible set.
         if not self._visible_indices:
             return
         try:
@@ -978,6 +1251,8 @@ class NSXIVApp:
         return offset + d * ((1.0 if d <= 0 else (mx - 1.0)) / CC_STEPS)
 
     def _effective_image(self):
+        if not self.img_frames:
+            return None
         im = self.img_frames[self.img_sel]
         if im.mode == 'RGBA':
             bg = Image.new('RGB', im.size, self.bg)
@@ -995,7 +1270,8 @@ class NSXIVApp:
         if self.gamma:
             g = self._steps_to_range(self.gamma, GAMMA_MAX, 1.0)
             inv = 1.0 / max(0.01, g)
-            lut = [min(255, int(255 * ((i / 255.0) ** inv) + 0.5)) for i in range(256)]
+            lut = [min(255, int(255 * ((i / 255.0) ** inv) + 0.5))
+                   for i in range(256)]
             if im.mode == 'L':
                 im = im.point(lut)
             else:
@@ -1036,11 +1312,15 @@ class NSXIVApp:
 
     def render_image(self):
         if not self.img_frames:
+            self.canvas.delete('all')
+            self.tk_img = None
             return
         self._fit()
         self._check_pan()
 
         im = self._effective_image()
+        if im is None:
+            return
         iw, ih = im.size
         if iw == 0 or ih == 0:
             return
@@ -1266,7 +1546,7 @@ class NSXIVApp:
                     x + self._tile_w - 2,  y + self._tile_h - 2,
                     fill=self.mark_fg, outline=self.mark_fg)
 
-            label = os.path.basename(self.files[abs_i].name)
+            label = self.files[abs_i].label
             self.gallery_canvas.create_text(
                 x + self._tile_w // 2,
                 y + self._tile_h + self._tile_caption_h // 2,
@@ -1334,7 +1614,7 @@ class NSXIVApp:
     def _populate_listbox(self):
         self.listbox.delete(0, END)
         for i in self._visible_indices:
-            self.listbox.insert(END, os.path.basename(self.files[i].name))
+            self.listbox.insert(END, self.files[i].label)
         for pos, i in enumerate(self._visible_indices):
             if self.files[i].flags & FF_MARK:
                 self.listbox.itemconfig(pos, bg=THEME['selected_bg'],
@@ -1382,7 +1662,7 @@ class NSXIVApp:
         self.listbox.select_set(pos)
         self.listbox.see(pos)
 
-        name = os.path.basename(self.files[self.fileidx].name)
+        name = self.files[self.fileidx].label
         self.list_filename.config(text=name)
         self.list_preview.config(image='', text=f'Loading {name}…')
 
@@ -1425,12 +1705,13 @@ class NSXIVApp:
         if not self.show_bar:
             return
         cnt_all = len(self.files)
-        cnt_vis = len(self._visible_indices)
         if cnt_all == 0:
+            self.status.config(text='')
             return
+        cnt_vis = len(self._visible_indices)
         fw = len(str(cnt_all))
         mark = '* ' if (self.files[self.fileidx].flags & FF_MARK) else ''
-        name = os.path.basename(self.files[self.fileidx].name)
+        name = self.files[self.fileidx].label
 
         vis_pos = 0
         if self.fileidx in self._visible_indices:
@@ -1460,17 +1741,51 @@ class NSXIVApp:
             text = f"{mark}{'  '.join(parts)}  {name}"
         self.status.config(text=text)
 
-    # ---------------------------------------------------------- quit
+    # ---------------------------------------------------------- quit / output
+    def _collect_selection(self):
+        marked = [f for f in self.files if f.flags & FF_MARK]
+        if not marked and 0 <= self.fileidx < len(self.files):
+            marked = [self.files[self.fileidx]]
+        return marked
+
+    def _emit_selector_output(self):
+        marked = self._collect_selection()
+        if not marked:
+            return
+        return_label = getattr(self.opts, 'return_label', False)
+        out = []
+        for f in marked:
+            out.append(f.label if return_label else f.path)
+        sep = '\0' if getattr(self.opts, 'using_null', False) else '\n'
+        for line in out:
+            sys.stdout.write(line + sep)
+        sys.stdout.flush()
+
+    def _emit_viewer_output(self):
+        if not getattr(self.opts, 'stdout', False):
+            return
+        sep = '\0' if getattr(self.opts, 'using_null', False) else '\n'
+        marked = [f for f in self.files if f.flags & FF_MARK]
+        if not marked and 0 <= self.fileidx < len(self.files):
+            marked = [self.files[self.fileidx]]
+        for f in marked:
+            sys.stdout.write(f.name + sep)
+        sys.stdout.flush()
+
     def quit(self, status=0):
         if self._quitting:
             return
         self._quitting = True
-        if self.opts.stdout:
-            sep = '\0' if self.opts.using_null else '\n'
-            marked = [f for f in self.files if f.flags & FF_MARK]
-            for f in (marked if marked else [self.files[self.fileidx]]):
-                sys.stdout.write(f.name + sep)
-            sys.stdout.flush()
+        self._scan_cancel = True
+        try:
+            if self.purpose == 'select':
+                if status == 0:
+                    self._emit_selector_output()
+            else:
+                if status == 0:
+                    self._emit_viewer_output()
+        except Exception:
+            pass
         for exc in (self._img_executor, self._thumb_executor):
             try:
                 exc.shutdown(wait=False, cancel_futures=True)
@@ -1485,6 +1800,10 @@ class NSXIVApp:
             self.root.destroy()
         except Exception:
             pass
+        try:
+            sys.exit(status)
+        except SystemExit:
+            raise
 
     # ---------------------------------------------------------- navigation
     def _navigate(self, n):
@@ -1495,6 +1814,7 @@ class NSXIVApp:
         if self.mode == MODE_IMAGE:
             self.load_image_async(n)
         else:
+            self._set_current(n) if n != self.fileidx else None
             self.fileidx = n
             self._pending_gallery_scroll = n
             self.redraw()
@@ -1530,7 +1850,7 @@ class NSXIVApp:
                 self._nav_visible(-1)
             elif direction == DIR_DOWN:
                 self._nav_visible(1)
-        else:  # gallery
+        else:
             cols = max(self._gallery_cols, 1)
             if direction == DIR_UP:
                 self._nav_visible(-cols)
@@ -1546,12 +1866,15 @@ class NSXIVApp:
             self.act_navigate(direction * 10)
         elif self.mode == MODE_LIST:
             self._nav_visible(direction * 20)
-        else:  # gallery
+        else:
             rows = max(1, self.win_h // (self._tile_h + self._tile_caption_h
                                          + self._tile_pad))
             self._nav_visible(direction * rows * max(self._gallery_cols, 1))
 
     def _key_return(self):
+        if self.purpose == 'select':
+            self.quit(0)
+            return
         if self.mode == MODE_LIST:
             self._enter_image_mode()
         elif self.mode == MODE_GALLERY:
@@ -1563,7 +1886,7 @@ class NSXIVApp:
         if self._filter_text:
             self.search_var.set("")
         else:
-            self.quit(0)
+            self.quit(1 if self.purpose == 'select' else 0)
 
     def _key_delete(self):
         self.act_remove()
@@ -1595,7 +1918,8 @@ class NSXIVApp:
         self.reset_timeout('slideshow')
         if was != MODE_IMAGE:
             self._show_content()
-            self.load_image_async(self.fileidx)
+            if self.files:
+                self.load_image_async(self.fileidx)
         self.search_entry.focus_set()
 
     def _enter_gallery_mode(self):
@@ -1627,12 +1951,6 @@ class NSXIVApp:
         self._populate_listbox()
         self.redraw()
         self.search_entry.focus_set()
-
-    def _key_next(self):
-        self._nav_visible(1)
-
-    def _key_prev(self):
-        self._nav_visible(-1)
 
     # ---------------------------------------------------------- actions
     def act_first(self):
@@ -1668,6 +1986,8 @@ class NSXIVApp:
         self.redraw()
 
     def act_reload(self):
+        if not self.files:
+            return
         if self.mode == MODE_IMAGE:
             self._prefetch_cache.pop(self.fileidx, None)
             self.load_image_async(self.fileidx)
@@ -1676,6 +1996,8 @@ class NSXIVApp:
             self.redraw()
 
     def act_remove(self):
+        if not self.files:
+            return
         if self.remove_file(self.fileidx, True):
             if self.mode == MODE_IMAGE:
                 self.load_image_async(self.fileidx)
@@ -1695,6 +2017,8 @@ class NSXIVApp:
         return False
 
     def act_toggle_mark(self):
+        if not self.files:
+            return
         self._mark(self.fileidx, not (self.files[self.fileidx].flags & FF_MARK))
         self.markidx = self.fileidx
         if self.mode == MODE_LIST:
@@ -1739,7 +2063,6 @@ class NSXIVApp:
             self._gallery_zoom(d)
             return
         if self.mode == MODE_LIST:
-            # In list mode, treat +/- as change of preview size? No-op.
             return
         if d > 0:
             for z in ZOOM_LEVELS:
@@ -1875,9 +2198,20 @@ class NSXIVApp:
             if button == 1:
                 n = self._gallery_hit(event.x, event.y)
                 if n is not None:
-                    self.fileidx = n
-                    self._pending_gallery_scroll = n
-                    self.redraw()
+                    if self.purpose == 'select':
+                        # Single-click selects in gallery; use Ctrl-click to toggle mark
+                        ctrl = bool(event.state & 0x0004)
+                        if ctrl:
+                            self._mark(n, not (self.files[n].flags & FF_MARK))
+                            self.redraw()
+                        else:
+                            self.fileidx = n
+                            self._pending_gallery_scroll = n
+                            self.redraw()
+                    else:
+                        self.fileidx = n
+                        self._pending_gallery_scroll = n
+                        self.redraw()
             elif button == 3:
                 n = self._gallery_hit(event.x, event.y)
                 if n is not None:
@@ -1887,7 +2221,7 @@ class NSXIVApp:
                 self._gallery_scroll_by(-max(self._tile_h // 2, 30))
             elif button == 5:
                 self._gallery_scroll_by(max(self._tile_h // 2, 30))
-        else:  # list
+        else:
             if button == 1:
                 sel = self.listbox.nearest(event.y)
                 if sel >= 0:
@@ -1922,7 +2256,8 @@ class NSXIVApp:
 
     def _poll_autoreload(self):
         try:
-            if self.mode == MODE_IMAGE and self.img_frames:
+            if (self.mode == MODE_IMAGE and self.img_frames
+                    and 0 <= self.fileidx < len(self.files)):
                 path = self.files[self.fileidx].path
                 try:
                     mt = os.path.getmtime(path)
@@ -1938,1235 +2273,13 @@ class NSXIVApp:
             pass
 
 
-# ============================================================ selector
-SUPPORTED_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
-
-CACHE_SIZE = 800
-PRELOAD_AHEAD = 3
-DECODE_WORKERS = max(2, min(8, os.cpu_count() or 4))
-
-DISK_CACHE_ENABLED = True
-CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "sel_img_thumbs"
-CACHE_WEBP_QUALITY = 82
-
-
-def _get_orig_size(path):
-    try:
-        with Image.open(path) as img:
-            return img.size
-    except Exception:
-        return (0, 0)
-
-
-def _disk_cache_path(path, w, h):
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    key = hashlib.sha1(
-        f"{path}|{st.st_mtime_ns}|{st.st_size}|{w}x{h}".encode("utf-8")
-    ).hexdigest()
-    return CACHE_DIR / key[:2] / (key + ".webp")
-
-
-def _decode_image(path, max_w, max_h):
-    orig_size = _get_orig_size(path)
-    cache_file = _disk_cache_path(path, max_w, max_h) if DISK_CACHE_ENABLED else None
-
-    if cache_file is not None and cache_file.exists():
-        try:
-            with Image.open(cache_file) as img:
-                img.load()
-                return img, orig_size
-        except Exception:
-            try:
-                cache_file.unlink()
-            except OSError:
-                pass
-
-    pil_img = None
-    if HAS_VIPS and HAS_NUMPY:
-        try:
-            v = pyvips.Image.thumbnail(path, max_w, height=max_h, size="down")
-            arr = v.numpy()
-            if v.bands == 4:
-                pil_img = Image.fromarray(arr.copy(), "RGBA")
-            elif v.bands == 3:
-                pil_img = Image.fromarray(arr.copy(), "RGB")
-            else:
-                pil_img = Image.fromarray(arr.copy()).convert("RGB")
-        except Exception:
-            pil_img = None
-
-    if pil_img is None:
-        try:
-            with Image.open(path) as img:
-                if img.format == "JPEG":
-                    img.draft("RGB", (max_w, max_h))
-                if img.width > max_w * 4 or img.height > max_h * 4:
-                    factor = max(1, min(img.width // (max_w * 2),
-                                        img.height // (max_h * 2)))
-                    if factor > 1:
-                        img = img.reduce(factor)
-                img.thumbnail((max_w, max_h),
-                              Image.Resampling.BILINEAR,
-                              reducing_gap=2.0)
-                if img.mode not in ("RGB", "RGBA"):
-                    img = img.convert("RGBA" if "A" in img.mode else "RGB")
-                img.load()
-                pil_img = img
-        except Exception:
-            pil_img = None
-
-    if pil_img is not None and cache_file is not None:
-        tmp = None
-        try:
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cache_file.with_name(cache_file.name + ".tmp")
-            pil_img.save(tmp, "WEBP", quality=CACHE_WEBP_QUALITY, method=0)
-            os.replace(tmp, cache_file)
-        except Exception:
-            if tmp is not None:
-                try:
-                    tmp.unlink()
-                except Exception:
-                    pass
-    return pil_img, orig_size
-
-
-class GalleryTile(Frame):
-    __slots__ = ("app", "index", "label", "path", "_photo",
-                 "_selected", "_current", "thumb", "caption")
-
-    def __init__(self, parent, app, index, label, path):
-        super().__init__(parent, bg=THEME["bg_secondary"],
-                         highlightthickness=2,
-                         highlightbackground=THEME["bg_secondary"])
-        self.app = app
-        self.index = index
-        self.label = label
-        self.path = path
-        self._photo = None
-        self._selected = False
-        self._current = False
-
-        self.thumb = Label(self, bg=THEME["bg_secondary"], text="…",
-                           fg=THEME["fg_text"], font=("sans-serif", 10),
-                           width=1, height=1)
-        self.thumb.pack(side=TOP, fill=BOTH, expand=True, padx=2, pady=(2, 0))
-
-        self.caption = Label(self, bg=THEME["bg_secondary"], text=label,
-                             fg=THEME["fg_text"], font=("sans-serif", 9),
-                             anchor="center", justify="center",
-                             wraplength=max(40, app._tile_w - 12))
-        self.caption.pack(side=BOTTOM, fill=X, padx=2, pady=(0, 2))
-
-        self.configure(width=app._tile_w,
-                       height=app._tile_h + app._tile_caption_h)
-        self.pack_propagate(False)
-
-        for w in (self, self.thumb, self.caption):
-            w.bind("<Button-1>", self._on_click)
-            w.bind("<Double-Button-1>", self._on_double)
-            w.bind("<Enter>", self._on_enter)
-            w.bind("<Leave>", self._on_leave)
-
-    def _on_click(self, event=None):
-        self.app._select_and_show(self.index, from_gallery=True)
-        return "break"
-
-    def _on_double(self, event=None):
-        self.app._select_and_show(self.index, from_gallery=True)
-        self.app._on_confirm()
-        return "break"
-
-    def _on_enter(self, event=None):
-        if not self._selected and not self._current:
-            self.configure(highlightbackground=THEME["hover_border"])
-
-    def _on_leave(self, event=None):
-        self._refresh_border()
-
-    def set_photo(self, photo):
-        self._photo = photo
-        if photo is not None:
-            self.thumb.config(image=photo, text="")
-            self.thumb.image = photo
-        else:
-            self.thumb.config(image="", text="✕")
-
-    def update_item(self, index, label, path):
-        self.index = index
-        if self.path == path:
-            if self.label != label:
-                self.label = label
-                self.caption.config(text=label)
-            return False
-        self.label = label
-        self.path = path
-        self.caption.config(text=label)
-        self._photo = None
-        self.thumb.config(image="", text="…")
-        return True
-
-    def set_selected(self, selected):
-        if self._selected == selected:
-            return
-        self._selected = selected
-        self._refresh_border()
-
-    def set_current(self, current):
-        if self._current == current:
-            return
-        self._current = current
-        self._refresh_border()
-
-    def _refresh_border(self):
-        if self._selected:
-            self.configure(highlightbackground=THEME["selected_bg"],
-                           highlightthickness=3)
-        elif self._current:
-            self.configure(highlightbackground=THEME["accent"],
-                           highlightthickness=2)
-        else:
-            self.configure(highlightbackground=THEME["bg_secondary"],
-                           highlightthickness=2)
-
-
-class ImageSelector:
-    def __init__(self, root, image_paths, display_labels=None,
-                 pre_select_labels=None, pass_idx=0, idx_write_path="",
-                 custom_title="", gallery_rows=None, gallery_cols=None,
-                 gallery_tile_size=None):
-        self._gallery_rows_opt = (gallery_rows
-                                  if gallery_rows and gallery_rows > 0 else None)
-        self._gallery_cols_opt = (gallery_cols
-                                  if gallery_cols and gallery_cols > 0 else None)
-        self._gallery_tile_opt = (gallery_tile_size
-                                  if gallery_tile_size and gallery_tile_size > 0
-                                  else None)
-        self._gallery_tile_user_override = None
-
-        self.idx_write_path = idx_write_path
-        self.custom_title = custom_title
-        self.root = root
-        if display_labels is None:
-            self.all_items = [(os.path.basename(p), p) for p in image_paths]
-        else:
-            if len(display_labels) != len(image_paths):
-                raise ValueError(
-                    "display_labels and image_paths must have same length")
-            self.all_items = list(zip(display_labels, image_paths))
-        self.filtered_items = self.all_items.copy()
-        self.path_to_abs_index = {
-            path: idx for idx, (_, path) in enumerate(self.all_items)}
-        self._pending_future = None
-        self._last_index = -1
-        self._after_id = None
-        self._scan_thread = None
-        self._scan_done = threading.Event()
-        self._scan_done.set()
-        self.selected_path = None
-        self.selected_label = None
-        self.selected_paths = set()
-        self._base_status_text = ""
-
-        self.view_mode = "list"
-        self._gallery_resize_after = None
-        self._gallery_gen = 0
-
-        self._tile_w = 240
-        self._tile_h = 240
-        self._tile_caption_h = 34
-        self._tile_pad = 10
-        self._tile_thumb_max = (self._tile_w - 5, self._tile_h - 5)
-
-        self._decode_q = queue.Queue()
-        self._decode_tokens = {}
-        self._decode_token_lock = threading.Lock()
-        self._decode_token_counter = 0
-        self._decode_threads = []
-        self._decode_stop = threading.Event()
-        self._start_decode_workers()
-
-        self._pil_cache = {}
-        self._photo_cache = {}
-        self._cache_lock = threading.Lock()
-
-        self._gallery_tiles = {}
-        self._visible_range = (0, 0)
-        self._gallery_cols = 1
-        self._gallery_grid_dirty = True
-        self._gallery_built = False
-        self._pending_gallery_scroll = None
-
-        if pre_select_labels:
-            self._apply_pre_select(pre_select_labels)
-
-        self._closing = False
-
-        self._setup_window()
-        self._build_ui()
-        self._bind_events()
-        self._populate_list()
-        if self.filtered_items:
-            self._select_and_show(pass_idx)
-        self.input.focus_set()
-
-    def _start_decode_workers(self):
-        for _ in range(DECODE_WORKERS):
-            t = threading.Thread(target=self._decode_worker, daemon=True)
-            t.start()
-            self._decode_threads.append(t)
-
-    def _decode_worker(self):
-        while not self._decode_stop.is_set():
-            try:
-                job = self._decode_q.get(timeout=0.25)
-            except queue.Empty:
-                continue
-            if job is None:
-                break
-            path, max_w, max_h, token, callback = job
-            if self._closing or self._decode_stop.is_set():
-                continue
-            with self._decode_token_lock:
-                latest = self._decode_tokens.get(path)
-            if latest is not None and latest != token:
-                continue
-            pil_img, orig_size = _decode_image(path, max_w, max_h)
-            if self._closing or self._decode_stop.is_set():
-                continue
-            try:
-                self.root.after(0, callback, pil_img, token, orig_size)
-            except Exception:
-                pass
-
-    def _request_decode(self, path, max_w, max_h, callback):
-        with self._decode_token_lock:
-            self._decode_token_counter += 1
-            token = self._decode_token_counter
-            self._decode_tokens[path] = token
-        self._decode_q.put((path, max_w, max_h, token, callback))
-        return token
-
-    def _cache_get(self, path, w, h):
-        key = (path, w, h)
-        with self._cache_lock:
-            entry = self._photo_cache.get(key)
-            if entry is not None:
-                self._photo_cache.pop(key, None)
-                self._photo_cache[key] = entry
-            return entry
-
-    def _cache_put(self, path, w, h, entry):
-        key = (path, w, h)
-        with self._cache_lock:
-            self._photo_cache[key] = entry
-            while len(self._photo_cache) > CACHE_SIZE:
-                oldest = next(iter(self._photo_cache))
-                del self._photo_cache[oldest]
-
-    def _load_thumbnail_async(self, path, w, h, on_ready):
-        cached = self._cache_get(path, w, h)
-        if cached is not None:
-            photo, orig_size = cached
-            on_ready(photo, orig_size)
-            return photo
-
-        def _done(pil_img, token, orig_size):
-            if self._closing:
-                return
-            if pil_img is None:
-                on_ready(None, orig_size)
-                return
-            try:
-                photo = ImageTk.PhotoImage(pil_img)
-            except Exception:
-                on_ready(None, orig_size)
-                return
-            self._cache_put(path, w, h, (photo, orig_size))
-            on_ready(photo, orig_size)
-        self._request_decode(path, w, h, _done)
-        return None
-
-    def _apply_pre_select(self, pre_select_labels):
-        target_labels = set(pre_select_labels)
-        matched = set()
-        for label, path in self.all_items:
-            if label in target_labels and label not in matched:
-                self.selected_paths.add(path)
-                matched.add(label)
-
-    def _setup_window(self):
-        self.root.title(self.custom_title or "Image Selector")
-        self.root.configure(bg=THEME["bg_primary"])
-        self.root.attributes('-topmost', True)
-        try:
-            self.root.attributes('-type', 'dialog')
-        except Exception:
-            pass
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        self.root.geometry(f"{sw - 100}x{sh - 100}+50+50")
-        self.root.minsize(600, 400)
-
-    def _build_ui(self):
-        self.main_frame = Frame(self.root, bg=THEME["bg_primary"])
-        self.main_frame.pack(fill=BOTH, expand=True, padx=10, pady=10)
-
-        self.bottom_bar = Frame(self.main_frame, bg=THEME["bg_primary"])
-        self.bottom_bar.pack(side=BOTTOM, fill=X, pady=(5, 0))
-
-        self.status_label = Label(
-            self.bottom_bar, bg=THEME["bg_primary"], fg=THEME["fg_text"],
-            font=("sans-serif", 10), anchor="e")
-        self.status_label.pack(side=TOP, fill=X)
-
-        self.search_var = StringVar()
-        self.search_var.trace_add("write", self._on_search)
-        self.input = Entry(
-            self.bottom_bar, textvariable=self.search_var,
-            bg=THEME["bg_input"], fg=THEME["fg_text"],
-            insertbackground=THEME["fg_text"],
-            highlightthickness=1,
-            highlightbackground=THEME["bg_secondary"],
-            highlightcolor=THEME["accent"],
-            relief="flat", font=("sans-serif", 12))
-        self.input.pack(side=TOP, fill=X, pady=(0, 4))
-
-        self.left_frame = Frame(self.main_frame, bg=THEME["bg_primary"], width=300)
-        self.left_frame.pack(side=LEFT, fill=BOTH, expand=False)
-        self.left_frame.pack_propagate(False)
-
-        list_container = Frame(self.left_frame, bg=THEME["bg_primary"])
-        list_container.pack(side=TOP, fill=BOTH, expand=True)
-
-        scrollbar = Scrollbar(list_container, bg=THEME["bg_secondary"])
-        scrollbar.pack(side=RIGHT, fill=Y)
-
-        self.listbox = Listbox(
-            list_container, selectmode=SINGLE,
-            bg=THEME["bg_secondary"], fg=THEME["fg_text"],
-            selectbackground=THEME["accent"],
-            selectforeground=THEME["accent_fg"],
-            borderwidth=0, highlightthickness=0,
-            font=("sans-serif", 11), activestyle="none",
-            yscrollcommand=scrollbar.set, takefocus=0)
-        self.listbox.pack(side=LEFT, fill=BOTH, expand=True)
-        scrollbar.config(command=self.listbox.yview)
-
-        self.right_frame = Frame(self.main_frame, bg=THEME["bg_primary"])
-        self.right_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=(10, 0))
-
-        self.filename_label = Label(
-            self.right_frame, bg=THEME["bg_primary"], fg=THEME["fg_bright"],
-            font=("sans-serif", 12, "bold"), anchor="w")
-        self.filename_label.pack(side=TOP, fill=X, pady=(0, 5))
-
-        self.image_container = Frame(self.right_frame, bg=THEME["bg_secondary"])
-        self.image_container.pack(fill=BOTH, expand=True)
-
-        self.image_label = Label(
-            self.image_container, bg=THEME["bg_secondary"],
-            text="Loading...", fg=THEME["fg_text"], font=("sans-serif", 14))
-        self.image_label.place(relx=0.5, rely=0.5, anchor="center")
-
-        self.gallery_frame = Frame(self.main_frame, bg=THEME["bg_primary"])
-        self.gallery_canvas = Canvas(
-            self.gallery_frame, bg=THEME["bg_primary"],
-            highlightthickness=0, bd=0)
-        self.gallery_vsb = Scrollbar(
-            self.gallery_frame, orient="vertical",
-            command=self.gallery_canvas.yview, bg=THEME["bg_secondary"])
-        self.gallery_canvas.configure(yscrollcommand=self.gallery_vsb.set)
-        self.gallery_canvas.pack(side=LEFT, fill=BOTH, expand=True)
-        self.gallery_vsb.pack(side=RIGHT, fill=Y)
-
-        self.gallery_inner = Frame(self.gallery_canvas, bg=THEME["bg_primary"])
-        self._gallery_inner_id = self.gallery_canvas.create_window(
-            (0, 0), window=self.gallery_inner, anchor=NW)
-        self.gallery_inner.bind(
-            "<Configure>",
-            lambda e: self.gallery_canvas.configure(
-                scrollregion=self.gallery_canvas.bbox("all")))
-        self.gallery_canvas.bind("<Configure>", self._on_gallery_canvas_resize)
-        self.gallery_canvas.bind("<MouseWheel>", self._on_gallery_mousewheel)
-        self.gallery_vsb.bind("<MouseWheel>", self._on_gallery_mousewheel)
-
-    def _bind_events(self):
-        self.listbox.bind("<<ListboxSelect>>", self._on_list_select)
-        self.listbox.bind("<Double-Button-1>", self._on_confirm)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_cancel)
-
-        for widget in (self.input, self.listbox):
-            widget.bind("<Up>", self._nav_up)
-            widget.bind("<Down>", self._nav_down)
-        self.input.bind("<Left>", self._nav_left)
-        self.input.bind("<Right>", self._nav_right)
-
-        self.input.bind("<Return>", self._on_confirm)
-        self.input.bind("<Control-Return>", self._on_ctrl_return)
-        self.input.bind("<Escape>", self._on_cancel)
-        self.input.bind("<Control-c>", self._on_ctl_c)
-        self.listbox.bind("<Return>", self._on_confirm)
-        self.listbox.bind("<Control-Return>", self._on_ctrl_return)
-        self.listbox.bind("<Escape>", self._on_cancel)
-        self.listbox.bind("<Control-c>", self._on_ctl_c)
-
-        self.listbox.bind("<Button-1>", self._refocus_entry)
-        self.listbox.bind("<Key>", self._refocus_input)
-        self.listbox.bind("<MouseWheel>", self._on_mousewheel)
-        self.root.bind("<MouseWheel>", self._on_mousewheel)
-        self.image_container.bind("<Configure>", self._on_container_resize)
-
-        self.root.bind("<Control-g>", self._toggle_view)
-        self.root.bind("<Control-G>", self._toggle_view)
-        self.input.bind("<Tab>", self._toggle_view)
-        self.listbox.bind("<Tab>", self._toggle_view)
-        self.gallery_canvas.bind("<Tab>", self._toggle_view)
-
-        self.gallery_canvas.bind("<Return>", self._on_confirm)
-        self.gallery_canvas.bind("<Control-Return>", self._on_ctrl_return)
-        self.gallery_canvas.bind("<Escape>", self._on_cancel)
-        self.gallery_canvas.bind("<Control-c>", self._on_ctl_c)
-        self.gallery_canvas.bind("<Up>", self._gallery_move_up)
-        self.gallery_canvas.bind("<Down>", self._gallery_move_down)
-        self.gallery_canvas.bind("<Left>", self._gallery_move_left)
-        self.gallery_canvas.bind("<Right>", self._gallery_move_right)
-        self.gallery_canvas.bind("<Prior>", lambda e: self._gallery_page(-1))
-        self.gallery_canvas.bind("<Next>", lambda e: self._gallery_page(1))
-        self.gallery_canvas.bind("<Button-1>", self._refocus_entry)
-        self.gallery_canvas.bind("<Key>", self._gallery_key_to_entry)
-
-        for w in (self.root, self.gallery_canvas):
-            w.bind("<plus>", lambda e: self._gallery_zoom_event(1, e))
-            w.bind("<equal>", lambda e: self._gallery_zoom_event(1, e))
-            w.bind("<minus>", lambda e: self._gallery_zoom_event(-1, e))
-            w.bind("<Control-plus>", lambda e: self._gallery_zoom_event(1, e))
-            w.bind("<Control-equal>", lambda e: self._gallery_zoom_event(1, e))
-            w.bind("<Control-minus>", lambda e: self._gallery_zoom_event(-1, e))
-            w.bind("<KP_Add>", lambda e: self._gallery_zoom_event(1, e))
-            w.bind("<KP_Subtract>", lambda e: self._gallery_zoom_event(-1, e))
-            w.bind("<Control-KP_Add>", lambda e: self._gallery_zoom_event(1, e))
-            w.bind("<Control-KP_Subtract>",
-                   lambda e: self._gallery_zoom_event(-1, e))
-
-        self.gallery_canvas.bind("<Configure>", self._on_gallery_scroll, add="+")
-
-    def _gallery_zoom_event(self, d, event=None):
-        if self.view_mode != "gallery":
-            return None
-        self._gallery_zoom(d)
-        return "break"
-
-    def _gallery_zoom(self, d):
-        step = GALLERY_ZOOM_STEP * d
-        base = (self._gallery_tile_user_override
-                if self._gallery_tile_user_override is not None
-                else self._tile_w)
-        new_size = base + step
-        new_size = max(GALLERY_TILE_MIN, min(GALLERY_TILE_MAX, new_size))
-        if new_size == self._gallery_tile_user_override:
-            return
-        self._gallery_tile_user_override = new_size
-        self._reset_gallery_tiles()
-        self._schedule_gallery_refresh(immediate=True)
-
-    def _refocus_entry(self, event=None):
-        self.input.focus_set()
-        return "break"
-
-    def _refocus_input(self, event=None):
-        if event and len(event.char) == 1 and event.char.isprintable():
-            self.input.focus_set()
-            self.input.insert(END, event.char)
-            self.input.icursor(END)
-            return "break"
-
-    def _gallery_key_to_entry(self, event=None):
-        if event and len(event.char) == 1 and event.char.isprintable():
-            self.input.focus_set()
-            self.input.insert(END, event.char)
-            self.input.icursor(END)
-            return "break"
-
-    def _nav_up(self, event=None):
-        if self.view_mode == "gallery":
-            return self._gallery_move_up(event)
-        return self._focus_list_up(event)
-
-    def _nav_down(self, event=None):
-        if self.view_mode == "gallery":
-            return self._gallery_move_down(event)
-        return self._focus_list_down(event)
-
-    def _nav_left(self, event=None):
-        if self.view_mode == "gallery":
-            return self._gallery_move_left(event)
-
-    def _nav_right(self, event=None):
-        if self.view_mode == "gallery":
-            return self._gallery_move_right(event)
-
-    def _populate_list(self):
-        self.listbox.delete(0, END)
-        for label, _ in self.filtered_items:
-            self.listbox.insert(END, label)
-        self._update_list_appearance()
-        if self.filtered_items:
-            self.listbox.select_set(0)
-
-    def _update_list_appearance(self):
-        for i, (label, path) in enumerate(self.filtered_items):
-            if path in self.selected_paths:
-                self.listbox.itemconfig(i, bg=THEME["selected_bg"],
-                                        fg=THEME["selected_fg"])
-            else:
-                self.listbox.itemconfig(i, bg=THEME["bg_secondary"],
-                                        fg=THEME["fg_text"])
-
-    def _append_to_list(self, path):
-        if self._closing:
-            return
-        label = os.path.basename(path)
-        self.all_items.append((label, path))
-        self.filtered_items.append((label, path))
-        idx = len(self.filtered_items) - 1
-        self.listbox.insert(END, label)
-        if path in self.selected_paths:
-            self.listbox.itemconfig(idx, bg=THEME["selected_bg"],
-                                    fg=THEME["selected_fg"])
-        self.path_to_abs_index[path] = len(self.all_items) - 1
-        if self.view_mode == "gallery":
-            self._reset_gallery_tiles()
-            self._schedule_gallery_refresh()
-        if idx == 0:
-            self.listbox.select_set(0)
-            self._select_and_show(0)
-
-    def _on_search(self, *args):
-        query = self.search_var.get().lower().strip()
-        terms = query.split() if query else []
-        self.filtered_items = [
-            item for item in self.all_items
-            if not terms or all(term in item[0].lower() for term in terms)]
-        self._populate_list()
-        if self.filtered_items:
-            self._last_index = -1
-            self._select_and_show(0)
-        else:
-            self._last_index = -1
-            self.filename_label.config(text="No matches")
-            self.image_label.config(image="", text="No matches")
-            self._base_status_text = "No matches"
-            self.status_label.config(
-                text=f"{self._base_status_text}  |  {len(self.selected_paths)} selected")
-        if self.view_mode == "gallery":
-            self._schedule_gallery_refresh()
-
-    def _reset_gallery_tiles(self):
-        for tile in self._gallery_tiles.values():
-            tile.destroy()
-        self._gallery_tiles.clear()
-        self._gallery_gen += 1
-        self._gallery_grid_dirty = True
-        self._gallery_built = False
-
-    def _on_list_select(self, event=None):
-        sel = self.listbox.curselection()
-        if sel:
-            self._select_and_show(sel[0])
-        self._refocus_entry()
-
-    def _select_and_show(self, index, from_gallery=False):
-        if not self.filtered_items:
-            return
-        index = max(0, min(index, len(self.filtered_items) - 1))
-        if index == self._last_index and not from_gallery:
-            return
-        if self.idx_write_path:
-            _, path = self.filtered_items[index]
-            abs_idx = self.path_to_abs_index.get(path, -1)
-            if abs_idx != -1:
-                try:
-                    with open(self.idx_write_path, 'w') as f:
-                        f.write(str(abs_idx))
-                except Exception:
-                    pass
-        self.listbox.selection_clear(0, END)
-        self.listbox.select_set(index)
-        self.listbox.see(index)
-        self._last_index = index
-        label, path = self.filtered_items[index]
-        self._update_gallery_selection(index)
-        if self.view_mode == "gallery":
-            self._scroll_gallery_to(index)
-            self._base_status_text = f"{index + 1} / {len(self.filtered_items)}"
-            self.status_label.config(
-                text=f"{self._base_status_text}  |  {len(self.selected_paths)} selected")
-            return
-        self.filename_label.config(text=label)
-        self.image_label.config(image="", text="Loading...")
-        self._base_status_text = f"Loading...  |  {index + 1} / {len(self.filtered_items)}"
-        self.status_label.config(
-            text=f"{self._base_status_text}  |  {len(self.selected_paths)} selected")
-        cw = max(self.image_container.winfo_width() - 20, 50)
-        ch = max(self.image_container.winfo_height() - 20, 50)
-        self._load_thumbnail_async(
-            path, cw, ch,
-            lambda photo, orig_size, i=index, p=path:
-                self._on_preview_ready(i, p, photo, orig_size))
-        self._preload_neighbors(index)
-
-    def _on_preview_ready(self, index, path, photo, orig_size):
-        if self._closing or index != self._last_index:
-            return
-        if self.view_mode != "list":
-            return
-        if photo is None:
-            self.image_label.config(image="", text="Failed to load")
-            self._base_status_text = "Error loading image"
-        else:
-            w, h = orig_size
-            try:
-                size_kb = os.path.getsize(path) / 1024
-            except Exception:
-                size_kb = 0
-            self.image_label.config(image=photo, text="")
-            self.image_label.image = photo
-            self._base_status_text = (
-                f"{w}×{h}  |  {size_kb:.1f} KB  |  "
-                f"{index + 1} / {len(self.filtered_items)}")
-        self.status_label.config(
-            text=f"{self._base_status_text}  |  {len(self.selected_paths)} selected")
-
-    def _preload_neighbors(self, center_index):
-        if self._closing:
-            return
-        cw = max(self.image_container.winfo_width() - 20, 50)
-        ch = max(self.image_container.winfo_height() - 20, 50)
-        for offset in range(-PRELOAD_AHEAD, PRELOAD_AHEAD + 1):
-            if offset == 0:
-                continue
-            idx = center_index + offset
-            if 0 <= idx < len(self.filtered_items):
-                _, path = self.filtered_items[idx]
-                self._load_thumbnail_async(path, cw, ch,
-                                           lambda photo, orig_size: None)
-
-    def _on_container_resize(self, event=None):
-        if self._closing:
-            return
-        if self._after_id:
-            self.root.after_cancel(self._after_id)
-        self._after_id = self.root.after(150, self._on_resize_done)
-
-    def _on_resize_done(self):
-        if self._closing:
-            return
-        if self._last_index >= 0 and self.filtered_items and self.view_mode == "list":
-            self._select_and_show(self._last_index, from_gallery=True)
-
-    def _focus_list_up(self, event=None):
-        if self.listbox.size() == 0:
-            return "break"
-        curr = self.listbox.curselection()
-        idx = curr[0] if curr else 0
-        new_idx = (idx - 1) % self.listbox.size()
-        self._select_and_show(new_idx)
-        return "break"
-
-    def _focus_list_down(self, event=None):
-        if self.listbox.size() == 0:
-            return "break"
-        curr = self.listbox.curselection()
-        idx = curr[0] if curr else 0
-        new_idx = (idx + 1) % self.listbox.size()
-        self._select_and_show(new_idx)
-        return "break"
-
-    def _on_mousewheel(self, event=None):
-        if self.view_mode == "gallery":
-            self._on_gallery_mousewheel(event)
-            return
-        if event and self.listbox.winfo_exists():
-            self.listbox.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    def _on_ctrl_return(self, event=None):
-        if not self.filtered_items or self._last_index < 0:
-            return "break"
-        path = self.filtered_items[self._last_index][1]
-        if path in self.selected_paths:
-            self.selected_paths.discard(path)
-        else:
-            self.selected_paths.add(path)
-        self._update_list_appearance()
-        self._update_gallery_selection(self._last_index)
-        self.status_label.config(
-            text=f"{self._base_status_text}  |  {len(self.selected_paths)} selected")
-        return "break"
-
-    def _on_ctl_c(self, event=None):
-        self.selected_path = None
-        self.selected_label = None
-        self.selected_paths = set()
-        self.selected_paths_list = []
-        self.selected_labels_list = []
-        self._shutdown()
-        self.root.quit()
-        sys.exit(99)
-
-    def _on_confirm(self, event=None):
-        result_paths = []
-        result_labels = []
-        for label, path in self.all_items:
-            if path in self.selected_paths and path not in result_paths:
-                result_paths.append(path)
-                result_labels.append(label)
-        if self._last_index >= 0 and self.filtered_items:
-            current_label, current_path = self.filtered_items[self._last_index]
-            if current_path not in result_paths:
-                result_paths.append(current_path)
-                result_labels.append(current_label)
-            self.selected_path = current_path
-            self.selected_label = current_label
-        else:
-            self.selected_path = None
-            self.selected_label = None
-        self.selected_paths_list = result_paths
-        self.selected_labels_list = result_labels
-        self._shutdown()
-        self.root.quit()
-
-    def _on_cancel(self, event=None):
-        self.selected_path = None
-        self.selected_label = None
-        self.selected_paths = set()
-        self.selected_paths_list = []
-        self.selected_labels_list = []
-        self._shutdown()
-        self.root.quit()
-
-    def _shutdown(self):
-        if self._closing:
-            return
-        self._closing = True
-        self._decode_stop.set()
-        try:
-            while True:
-                self._decode_q.get_nowait()
-        except queue.Empty:
-            pass
-        for _ in self._decode_threads:
-            try:
-                self._decode_q.put_nowait(None)
-            except Exception:
-                pass
-        if self._after_id:
-            try:
-                self.root.after_cancel(self._after_id)
-            except Exception:
-                pass
-        if self._gallery_resize_after:
-            try:
-                self.root.after_cancel(self._gallery_resize_after)
-            except Exception:
-                pass
-
-    def start_lazy_scan(self, paths, recursive=False, sort_time=False):
-        self._scan_done.clear()
-        self._scan_thread = threading.Thread(
-            target=self._scan_worker,
-            args=(paths, recursive, sort_time),
-            daemon=True)
-        self._scan_thread.start()
-
-    def _scan_worker(self, paths, recursive, sort_time):
-        seen = set()
-        for path in paths:
-            if self._closing:
-                break
-            p = Path(path).expanduser().resolve()
-            if not p.exists():
-                continue
-            if p.is_dir():
-                pattern = "**/*" if recursive else "*"
-                files = p.glob(pattern)
-                if sort_time:
-                    files = sorted(files, key=lambda x: x.stat().st_mtime,
-                                   reverse=True)
-                else:
-                    files = sorted(files)
-                for f in files:
-                    if self._closing:
-                        return
-                    if f.suffix.lower() in SUPPORTED_EXTS and f not in seen:
-                        seen.add(f)
-                        self.root.after(
-                            0, lambda fp=str(f): self._append_to_list(fp))
-            elif p.is_file() and p.suffix.lower() in SUPPORTED_EXTS \
-                    and str(p) not in seen:
-                seen.add(str(p))
-                self.root.after(
-                    0, lambda fp=str(p): self._append_to_list(fp))
-        self._scan_done.set()
-
-    def _toggle_view(self, event=None):
-        if self.view_mode == "list":
-            self._show_gallery()
-        else:
-            self._show_list()
-        return "break"
-
-    def _show_list(self):
-        self.view_mode = "list"
-        self.gallery_frame.pack_forget()
-        self.left_frame.pack(side=LEFT, fill=BOTH, expand=False)
-        self.right_frame.pack(side=LEFT, fill=BOTH, expand=True, padx=(10, 0))
-        self.input.focus_set()
-        if self._last_index >= 0 and self.filtered_items:
-            self._select_and_show(self._last_index, from_gallery=True)
-
-    def _show_gallery(self):
-        self.view_mode = "gallery"
-        self.left_frame.pack_forget()
-        self.right_frame.pack_forget()
-        self.gallery_frame.pack(side=LEFT, fill=BOTH, expand=True)
-        self._reset_gallery_tiles()
-        self.input.focus_set()
-        self.root.update_idletasks()
-        self._schedule_gallery_refresh(immediate=True)
-        if self._last_index >= 0:
-            self._scroll_gallery_to(self._last_index)
-        self._base_status_text = (
-            f"Gallery  |  "
-            f"{self._last_index + 1 if self._last_index >= 0 else 0}"
-            f" / {len(self.filtered_items)}")
-        self.status_label.config(
-            text=f"{self._base_status_text}  |  {len(self.selected_paths)} selected")
-
-    def _schedule_gallery_refresh(self, immediate=False):
-        if self._closing or self.view_mode != "gallery":
-            return
-        if self._gallery_resize_after:
-            self.root.after_cancel(self._gallery_resize_after)
-        delay = 0 if immediate else 50
-        self._gallery_resize_after = self.root.after(
-            delay, self._refresh_gallery)
-
-    def _on_gallery_canvas_resize(self, event=None):
-        self._gallery_grid_dirty = True
-        self._schedule_gallery_refresh(immediate=True)
-
-    def _on_gallery_scroll(self, event=None):
-        self._schedule_gallery_refresh()
-
-    def _on_gallery_mousewheel(self, event=None):
-        if self.view_mode != "gallery" or event is None:
-            return
-        self.gallery_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        self._schedule_gallery_refresh()
-
-    def _compute_tile_metrics(self):
-        cw = self.gallery_canvas.winfo_width()
-        ch = self.gallery_canvas.winfo_height()
-        if cw <= 1 or ch <= 1:
-            cw = max(self.root.winfo_width(), 1)
-            ch = max(self.root.winfo_height(), 1)
-        if cw <= 1 or ch <= 1:
-            cw, ch = 1200, 800
-        if self._gallery_tile_user_override is not None:
-            base = float(self._gallery_tile_user_override)
-        elif self._gallery_tile_opt is not None:
-            base = float(self._gallery_tile_opt)
-        else:
-            candidates = []
-            rows = self._gallery_rows_opt or GALLERY_TARGET_ROWS
-            candidates.append(ch / float(rows))
-            if self._gallery_cols_opt:
-                candidates.append(cw / float(self._gallery_cols_opt))
-            base = min(candidates)
-        q = GALLERY_SIZE_QUANTUM
-        tile = int(round(base / q)) * q
-        tile = max(GALLERY_TILE_MIN, min(GALLERY_TILE_MAX, tile))
-        pad = max(GALLERY_PAD_MIN, int(round(tile * GALLERY_PAD_RATIO)))
-        cap = max(GALLERY_CAPTION_MIN, int(round(tile * GALLERY_CAPTION_RATIO)))
-        return tile, tile, cap, pad
-
-    def _update_tile_metrics(self):
-        tw, th, cap, pad = self._compute_tile_metrics()
-        if (tw, th, cap, pad) == (self._tile_w, self._tile_h,
-                                  self._tile_caption_h, self._tile_pad):
-            return False
-        self._tile_w = tw
-        self._tile_h = th
-        self._tile_caption_h = cap
-        self._tile_pad = pad
-        self._tile_thumb_max = (max(1, tw - 5), max(1, th - 5))
-        return True
-
-    def _compute_cols(self):
-        canvas_w = max(self.gallery_canvas.winfo_width(), 1)
-        return max(1, (canvas_w - self._tile_pad)
-                   // (self._tile_w + self._tile_pad))
-
-    def _refresh_gallery(self):
-        if self._closing or self.view_mode != "gallery":
-            return
-        if self._update_tile_metrics():
-            for tile in self._gallery_tiles.values():
-                tile.destroy()
-            self._gallery_tiles.clear()
-            self._gallery_gen += 1
-            self._gallery_cols = 0
-        if not self.filtered_items:
-            for tile in self._gallery_tiles.values():
-                tile.destroy()
-            self._gallery_tiles.clear()
-            self._gallery_built = True
-            self._pending_gallery_scroll = None
-            return
-        if (self.gallery_canvas.winfo_width() <= 1
-                or self.gallery_canvas.winfo_height() <= 1):
-            return
-        cols = self._compute_cols()
-        if cols != self._gallery_cols:
-            self._gallery_cols = cols
-            for tile in self._gallery_tiles.values():
-                tile.destroy()
-            self._gallery_tiles.clear()
-            self._gallery_gen += 1
-        row_h = self._tile_h + self._tile_caption_h + self._tile_pad
-        col_w = self._tile_w + self._tile_pad
-        total_rows = (len(self.filtered_items) + cols - 1) // cols
-        total_h = total_rows * row_h + self._tile_pad
-        self.gallery_inner.configure(width=cols * col_w + self._tile_pad,
-                                     height=max(total_h, 1))
-        self.gallery_canvas.coords(self._gallery_inner_id, 0, 0)
-        self.gallery_canvas.configure(
-            scrollregion=(0, 0, cols * col_w + self._tile_pad, total_h))
-        if self._pending_gallery_scroll is not None:
-            idx = self._pending_gallery_scroll
-            self._pending_gallery_scroll = None
-            self._apply_gallery_scroll(idx)
-        canvas_h = max(self.gallery_canvas.winfo_height(), 1)
-        y_top = self.gallery_canvas.canvasy(0)
-        first_row = max(0, int(y_top // row_h) - GALLERY_OVERSCAN_ROWS)
-        last_row = min(total_rows - 1,
-                       int((y_top + canvas_h) // row_h) + GALLERY_OVERSCAN_ROWS)
-        first_idx = first_row * cols
-        last_idx = min(len(self.filtered_items), (last_row + 1) * cols)
-        for idx in list(self._gallery_tiles.keys()):
-            if idx < first_idx or idx >= last_idx:
-                self._gallery_tiles.pop(idx).destroy()
-        tw, th = self._tile_thumb_max
-        for idx in range(first_idx, last_idx):
-            label, path = self.filtered_items[idx]
-            tile = self._gallery_tiles.get(idx)
-            needs_thumb = False
-            if tile is None:
-                tile = GalleryTile(self.gallery_inner, self, idx, label, path)
-                r = idx // cols
-                c = idx % cols
-                tile.place(x=c * col_w + self._tile_pad // 2,
-                           y=r * row_h + self._tile_pad // 2,
-                           width=self._tile_w,
-                           height=self._tile_h + self._tile_caption_h)
-                self._gallery_tiles[idx] = tile
-                needs_thumb = True
-            elif tile.update_item(idx, label, path):
-                needs_thumb = True
-            tile.set_selected(path in self.selected_paths)
-            tile.set_current(idx == self._last_index)
-            if needs_thumb:
-                self._load_thumbnail_async(
-                    path, tw, th,
-                    lambda photo, orig_size, i=idx, p=path,
-                           g=self._gallery_gen:
-                        self._on_gallery_thumb_ready(i, p, photo, g))
-        self._gallery_built = True
-
-    def _on_gallery_thumb_ready(self, index, expected_path, photo, gen):
-        if self._closing or gen != self._gallery_gen:
-            return
-        tile = self._gallery_tiles.get(index)
-        if tile is None or tile.path != expected_path:
-            return
-        tile.set_photo(photo)
-
-    def _update_gallery_selection(self, current_index):
-        for idx, tile in self._gallery_tiles.items():
-            if idx >= len(self.filtered_items):
-                continue
-            path = self.filtered_items[idx][1]
-            tile.set_selected(path in self.selected_paths)
-            tile.set_current(idx == current_index)
-
-    def _scroll_gallery_to(self, index):
-        if index < 0 or index >= len(self.filtered_items):
-            return
-        self._pending_gallery_scroll = index
-        self._schedule_gallery_refresh(immediate=True)
-
-    def _apply_gallery_scroll(self, index):
-        cols = max(self._gallery_cols, 1)
-        row = index // cols
-        row_h = self._tile_h + self._tile_caption_h + self._tile_pad
-        row_top = row * row_h
-        row_bottom = row_top + row_h
-        canvas_h = max(self.gallery_canvas.winfo_height(), 1)
-        y_top = self.gallery_canvas.canvasy(0)
-        y_bottom = y_top + canvas_h
-        if row_top < y_top:
-            new_top = row_top
-        elif row_bottom > y_bottom:
-            new_top = row_bottom - canvas_h
-        else:
-            return
-        total = max(self.gallery_inner.winfo_reqheight(), 1)
-        self.gallery_canvas.yview_moveto(
-            max(0.0, min(1.0, new_top / total)))
-
-    def _gallery_cols_count(self):
-        return max(1, self._gallery_cols)
-
-    def _gallery_move_up(self, event=None):
-        if not self.filtered_items:
-            return "break"
-        idx = max(0, self._last_index - self._gallery_cols_count())
-        self._select_and_show(idx, from_gallery=True)
-        return "break"
-
-    def _gallery_move_down(self, event=None):
-        if not self.filtered_items:
-            return "break"
-        idx = min(len(self.filtered_items) - 1,
-                  self._last_index + self._gallery_cols_count())
-        self._select_and_show(idx, from_gallery=True)
-        return "break"
-
-    def _gallery_move_left(self, event=None):
-        if not self.filtered_items:
-            return "break"
-        idx = max(0, self._last_index - 1)
-        self._select_and_show(idx, from_gallery=True)
-        return "break"
-
-    def _gallery_move_right(self, event=None):
-        if not self.filtered_items:
-            return "break"
-        idx = min(len(self.filtered_items) - 1, self._last_index + 1)
-        self._select_and_show(idx, from_gallery=True)
-        return "break"
-
-    def _gallery_page(self, direction):
-        if not self.filtered_items:
-            return "break"
-        cols = self._gallery_cols_count()
-        canvas_h = max(self.gallery_canvas.winfo_height(), 1)
-        rows = max(1, canvas_h
-                   // (self._tile_h + self._tile_caption_h + self._tile_pad))
-        step = cols * rows * direction
-        idx = max(0, min(len(self.filtered_items) - 1, self._last_index + step))
-        self._select_and_show(idx, from_gallery=True)
-        return "break"
-
-
-# ============================================================ selector CLI
-def collect_images(paths, recursive=False, sort_time=False):
-    images = []
-    seen = set()
-    for path in paths:
-        p = Path(path).expanduser().resolve()
-        if p.is_dir():
-            pattern = "**/*" if recursive else "*"
-            files = p.glob(pattern)
-            if sort_time:
-                files = sorted(files, key=lambda x: x.stat().st_mtime,
-                               reverse=True)
-            else:
-                files = sorted(files)
-            for f in files:
-                if f.suffix.lower() in SUPPORTED_EXTS and f not in seen:
-                    images.append(str(f))
-                    seen.add(f)
-        elif p.is_file() and p.suffix.lower() in SUPPORTED_EXTS \
-                and str(p) not in seen:
-            images.append(str(p))
-            seen.add(str(p))
-    return images
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="tkiv select",
-        description="High-performance interactive image selector")
-    parser.add_argument("paths", nargs="*", default=["."],
-                        help="Directories or files to browse")
-    parser.add_argument("-r", "--recursive", action="store_true",
-                        help="Search recursively")
-    parser.add_argument("-t", "--time", action="store_true",
-                        help="Sort by modification time (newest first)")
-    parser.add_argument("--lazy", action="store_true",
-                        help="Lazy scan: show UI immediately, populate as files are found")
-    parser.add_argument("--dmenu-mode", action="store_true",
-                        help="Enable dmenu mode (list entries + image paths)")
-    parser.add_argument("--list-file",
-                        help="File containing newline-separated list entries")
-    parser.add_argument("--list-entries",
-                        help="Newline-separated list entries (as a string)")
-    parser.add_argument("--image-file",
-                        help="File containing newline-separated image file paths")
-    parser.add_argument("--image-entries",
-                        help="Newline-separated image file paths (as a string)")
-    parser.add_argument("--pass-idx",
-                        help="Pass the index to start the selector at")
-    parser.add_argument("--idx-write-path",
-                        help="File path to write the current index for debugging")
-    parser.add_argument("--return-label", action="store_true",
-                        help="In dmenu mode, output the selected list label "
-                             "instead of the image path")
-    parser.add_argument("--pre-select",
-                        help="Newline-separated labels to pre-select at launch")
-    parser.add_argument("--custom-title", help="Title of the window")
-    parser.add_argument("--pre-select-file",
-                        help="File containing newline-separated labels to pre-select")
-    parser.add_argument("--gallery", action="store_true",
-                        help="Start in gallery view")
-    parser.add_argument("--gallery-rows", type=float, default=None,
-                        help="Target number of gallery rows visible (default 3.5)")
-    parser.add_argument("--gallery-cols", type=int, default=None,
-                        help="Target number of gallery columns visible")
-    parser.add_argument("--gallery-tile-size", type=int, default=None,
-                        help="Explicit gallery tile size in pixels (overrides rows/cols)")
-    return parser.parse_args()
-
-
-def read_pre_select(args):
-    if args.pre_select and args.pre_select_file:
-        print("Error: both --pre-select and --pre-select-file provided.",
-              file=sys.stderr)
-        sys.exit(1)
-    if args.pre_select_file:
-        try:
-            with open(args.pre_select_file, 'r') as f:
-                return [line.rstrip('\n') for line in f]
-        except Exception as e:
-            print(f"Error reading pre-select file: {e}", file=sys.stderr)
-            sys.exit(1)
-    if args.pre_select:
-        return args.pre_select.split('\n')
-    return None
-
-
 # ============================================================ entry points
 def run_viewer():
     parser = build_viewer_parser()
     args = parser.parse_args()
 
     if args.help:
-        print(f"{PROGNAME} {VERSION}")
+        print(f"{PROGNAME} img {VERSION}")
         print(parser.format_usage().rstrip())
         print("\nKey bindings (search bar is always focused; actions use Ctrl+):")
         print("  Tab / Shift+Tab  cycle mode (image -> gallery -> list)")
@@ -3191,11 +2304,15 @@ def run_viewer():
         print("  -T N,  --gallery-tile-size  gallery tile size in pixels")
         print("  --gallery-rows N            target rows visible")
         print("  --gallery-cols N            target cols visible")
+        print("  --lazy                      populate file list as it is scanned")
         return 0
 
     if args.version:
-        print(f"{PROGNAME} {VERSION}")
+        print(f"{PROGNAME} img {VERSION}")
         return 0
+
+    if args.name is None and args.legacy_name:
+        args.name = args.legacy_name
 
     if args.class_:
         sys.stderr.write("tkiv img: --class is deprecated, use --name instead\n")
@@ -3208,6 +2325,7 @@ def run_viewer():
                          "Install with: pip install pyvips\n")
 
     file_list = []
+    scan_paths = []
     if args.from_stdin or (len(args.files) == 1 and args.files[0] == '-'):
         sep = '\0' if args.using_null else '\n'
         data = sys.stdin.read()
@@ -3215,17 +2333,30 @@ def run_viewer():
             if e:
                 file_list.append(e)
     else:
-        for f in args.files:
-            if not os.path.exists(f):
-                if not args.quiet:
-                    sys.stderr.write(f"{PROGNAME}: {f}: No such file or directory\n")
-                continue
-            if os.path.isdir(f):
-                file_list.extend(collect_dir(f, args.recursive, args.hidden))
-            else:
-                file_list.append(f)
+        if args.lazy:
+            # expand directories later, lazily
+            for f in args.files:
+                if os.path.isdir(f):
+                    scan_paths.append(f)
+                else:
+                    file_list.append(f)
+            if scan_paths:
+                # keep non-existent single paths? skip
+                pass
+        else:
+            for f in args.files:
+                if not os.path.exists(f):
+                    if not args.quiet:
+                        sys.stderr.write(
+                            f"{PROGNAME}: {f}: No such file or directory\n")
+                    continue
+                if os.path.isdir(f):
+                    file_list.extend(
+                        collect_dir(f, args.recursive, args.hidden, args.time))
+                else:
+                    file_list.append(f)
 
-    if not file_list:
+    if not file_list and not scan_paths:
         sys.stderr.write(f"{PROGNAME}: No valid image file given, aborting\n")
         return 1
 
@@ -3235,7 +2366,11 @@ def run_viewer():
         sys.stderr.write(f"{PROGNAME}: cannot open display: {e}\n")
         return 1
 
-    NSXIVApp(root, args, file_list)
+    entries = [FileEntry(p) for p in file_list]
+    app = TkivApp(root, args, entries, purpose='view',enable_floating_window=args.floating_window)
+    if args.lazy and scan_paths:
+        app.start_lazy_scan(scan_paths, recursive=args.recursive,
+                            sort_time=args.time)
     try:
         root.mainloop()
     except KeyboardInterrupt:
@@ -3244,137 +2379,132 @@ def run_viewer():
 
 
 def run_selector():
-    args = parse_args()
-    pre_select_labels = read_pre_select(args)
-    custom_title = args.custom_title or ""
-    pass_idx = int(args.pass_idx) if args.pass_idx else 0
-    idx_write_path = args.idx_write_path or ""
+    parser = build_selector_parser()
+    args = parser.parse_args()
+
+    if args.help:
+        print(f"{PROGNAME} select {VERSION}")
+        print(parser.format_usage().rstrip())
+        print("\nKey bindings match the viewer. Press Return to accept and print,")
+        print("Esc to cancel. Ctrl+M (or Ctrl+Enter) toggles a mark; when any")
+        print("file is marked, all marked files are printed on accept.")
+        return 0
+
+    if args.version:
+        print(f"{PROGNAME} select {VERSION}")
+        return 0
+
+    if not HAVE_VIPS and not args.quiet:
+        sys.stderr.write(f"{PROGNAME}: warning: pyvips not available; "
+                         "falling back to Pillow for image decoding.\n")
+
+    # --- Build entries list -------------------------------------------------
+    entries = []
+    scan_paths = []
 
     if args.dmenu_mode:
         if args.list_file and args.list_entries:
-            print("Error: both --list-file and --list-entries provided.",
-                  file=sys.stderr)
+            sys.stderr.write("Error: both --list-file and --list-entries provided.\n")
             sys.exit(1)
         if args.list_file:
             try:
                 with open(args.list_file, 'r') as f:
                     list_entries = [line.rstrip('\n') for line in f]
             except Exception as e:
-                print(f"Error reading list file: {e}", file=sys.stderr)
+                sys.stderr.write(f"Error reading list file: {e}\n")
                 sys.exit(1)
         elif args.list_entries:
             list_entries = args.list_entries.split('\n')
         else:
-            print("Error: must provide either --list-file or --list-entries",
-                  file=sys.stderr)
+            sys.stderr.write("Error: must provide either --list-file or "
+                             "--list-entries\n")
             sys.exit(1)
 
         if args.image_file and args.image_entries:
-            print("Error: both --image-file and --image-entries provided.",
-                  file=sys.stderr)
+            sys.stderr.write("Error: both --image-file and --image-entries provided.\n")
             sys.exit(1)
         if args.image_file:
             try:
                 with open(args.image_file, 'r') as f:
                     image_entries = [line.rstrip('\n') for line in f]
             except Exception as e:
-                print(f"Error reading image file: {e}", file=sys.stderr)
+                sys.stderr.write(f"Error reading image file: {e}\n")
                 sys.exit(1)
         elif args.image_entries:
             image_entries = args.image_entries.split('\n')
         else:
-            print("Error: must provide either --image-file or --image-entries",
-                  file=sys.stderr)
+            sys.stderr.write("Error: must provide either --image-file or "
+                             "--image-entries\n")
             sys.exit(1)
 
         if len(list_entries) != len(image_entries):
-            print(f"Error: number of list entries ({len(list_entries)}) and "
-                  f"image entries ({len(image_entries)}) do not match",
-                  file=sys.stderr)
+            sys.stderr.write(
+                f"Error: number of list entries ({len(list_entries)}) and "
+                f"image entries ({len(image_entries)}) do not match\n")
             sys.exit(1)
 
-        root = Tk()
-        app = ImageSelector(root, image_entries, display_labels=list_entries,
-                            pre_select_labels=pre_select_labels,
-                            pass_idx=pass_idx, idx_write_path=idx_write_path,
-                            custom_title=custom_title,
-                            gallery_rows=args.gallery_rows,
-                            gallery_cols=args.gallery_cols,
-                            gallery_tile_size=args.gallery_tile_size)
-        if args.gallery:
-            app._show_gallery()
-        root.mainloop()
-
-        if hasattr(app, 'selected_paths_list') and app.selected_paths_list:
-            if args.return_label:
-                for label in app.selected_labels_list:
-                    print(label)
-            else:
-                for path in app.selected_paths_list:
-                    print(path)
-            sys.stdout.flush()
-            os._exit(0)
-        elif app.selected_path is not None:
-            if args.return_label:
-                print(app.selected_label)
-            else:
-                print(app.selected_path)
-            sys.stdout.flush()
-            os._exit(0)
+        entries = [FileEntry(path, label)
+                   for label, path in zip(list_entries, image_entries)]
+        # dmenu entries may point at arbitrary paths — don't try to remove them
+        args.assume_files = True
+    else:
+        paths = args.paths or ['.']
+        if args.lazy:
+            for f in paths:
+                if os.path.isdir(f):
+                    scan_paths.append(f)
+                elif os.path.isfile(f) and file_is_image(f):
+                    entries.append(FileEntry(f))
+            if not entries and not scan_paths:
+                sys.stderr.write("No images found.\n")
+                sys.exit(1)
         else:
-            os._exit(1)
+            file_list = []
+            for f in paths:
+                if not os.path.exists(f):
+                    if not args.quiet:
+                        sys.stderr.write(f"{PROGNAME}: {f}: No such file or directory\n")
+                    continue
+                if os.path.isdir(f):
+                    file_list.extend(
+                        collect_dir(f, args.recursive, args.hidden, args.time))
+                elif os.path.isfile(f) and file_is_image(f):
+                    file_list.append(f)
+            if not file_list:
+                sys.stderr.write("No images found.\n")
+                sys.exit(1)
+            entries = [FileEntry(p) for p in file_list]
 
-    if args.lazy:
-        root = Tk()
-        app = ImageSelector(root, [], pre_select_labels=pre_select_labels,
-                            pass_idx=pass_idx, idx_write_path=idx_write_path,
-                            custom_title=custom_title,
-                            gallery_rows=args.gallery_rows,
-                            gallery_cols=args.gallery_cols,
-                            gallery_tile_size=args.gallery_tile_size)
-        if args.gallery:
-            app._show_gallery()
-        app.start_lazy_scan(args.paths, recursive=args.recursive,
+    if not entries and not scan_paths:
+        sys.stderr.write("No images found.\n")
+        sys.exit(1)
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        sys.stderr.write(f"{PROGNAME}: cannot open display: {e}\n")
+        sys.exit(1)
+
+    app = TkivApp(root, args, entries, purpose='select',enable_floating_window=args.floating_window)
+    if args.lazy and scan_paths:
+        app.start_lazy_scan(scan_paths, recursive=args.recursive,
                             sort_time=args.time)
-        root.mainloop()
-    else:
-        images = collect_images(args.paths, recursive=args.recursive,
-                                sort_time=args.time)
-        if not images:
-            print("No images found.", file=sys.stderr)
-            sys.exit(1)
-        root = Tk()
-        app = ImageSelector(root, images, pre_select_labels=pre_select_labels,
-                            pass_idx=pass_idx, idx_write_path=idx_write_path,
-                            custom_title=custom_title,
-                            gallery_rows=args.gallery_rows,
-                            gallery_cols=args.gallery_cols,
-                            gallery_tile_size=args.gallery_tile_size)
-        if args.gallery:
-            app._show_gallery()
-        root.mainloop()
 
-    if hasattr(app, 'selected_paths_list') and app.selected_paths_list:
-        for path in app.selected_paths_list:
-            print(path)
-        sys.stdout.flush()
-        os._exit(0)
-    elif app.selected_path is not None:
-        print(app.selected_path)
-        sys.stdout.flush()
-        os._exit(0)
-    else:
-        os._exit(1)
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 # ============================================================ dispatcher
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
         sys.stderr.write(
-            "usage: tkiv.py {img|select} [OPTIONS] ...\n"
+            f"usage: {os.path.basename(sys.argv[0])} {{img|select}} [OPTIONS] ...\n"
             "\n"
-            "  tkiv.py img    [OPTIONS] FILES...   image viewer\n"
-            "  tkiv.py select [OPTIONS] PATHS...   image selector / dmenu\n")
+            f"  {os.path.basename(sys.argv[0])} img    [OPTIONS] FILES...   image viewer\n"
+            f"  {os.path.basename(sys.argv[0])} select [OPTIONS] PATHS...   image selector / dmenu\n")
         return 0 if len(sys.argv) >= 2 else 1
 
     mode = sys.argv[1]
@@ -3388,9 +2518,13 @@ def main():
         return run_selector()
     else:
         sys.stderr.write(f"tkiv: unknown mode: {mode!r}\n")
-        sys.stderr.write("usage: tkiv.py {img|select} [OPTIONS] ...\n")
+        sys.stderr.write(
+            f"usage: {os.path.basename(sys.argv[0])} {{img|select}} [OPTIONS] ...\n")
         return 1
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
