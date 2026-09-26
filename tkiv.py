@@ -146,6 +146,13 @@ PREFETCH_MAX        = 3
 THUMB_MAX_IN_FLIGHT = 12
 QUEUE_POLL_MS       = 20
 
+# Lazy-scan tuning.  The scanner thread accumulates paths and posts them
+# to the main thread in batches of this size, so that the per-batch commit
+# cost (append + visible-index extend) is O(1) amortised per file instead
+# of O(N).  Redraws are coalesced separately via after_idle.
+LAZY_BATCH_SIZE     = 128
+LISTBOX_INSERT_CHUNK = 1000
+
 GALLERY_TILE_MIN   = 96
 GALLERY_TILE_MAX   = 512
 GALLERY_TARGET_ROWS = 3.5
@@ -573,6 +580,21 @@ class TkivApp:
         self._quitting = False
         self._scan_cancel = False
 
+        # ----- lazy-scan state ---------------------------------------------
+        # The scanner thread accumulates paths into batches and posts them
+        # to the main queue.  The main thread buffers them in
+        # `_lazy_pending` and commits the whole buffer in one O(1)-per-file
+        # step (append + extend) via `_commit_lazy_batch`.  Redraws are
+        # coalesced through `_lazy_needs_redraw` / `after_idle`.  This
+        # avoids the O(N^2) cost of redrawing / re-filtering / repopulating
+        # the listbox once per discovered file.
+        self._lazy_pending        = []
+        self._lazy_commit_pending = False
+        self._lazy_needs_redraw   = False
+        # Desired 1-based start index, applied after the first lazy batch
+        # commits (the list was empty when __init__ ran).
+        self._desired_start = max(0, getattr(opts, 'start_at', 1) - 1)
+
         # Filtering
         self._filter_text = ""
         self._visible_indices = list(range(len(self.files)))
@@ -961,14 +983,14 @@ class TkivApp:
 
     def _rebuild_visible(self):
         query = self._filter_text.lower().strip()
-        terms = query.split() if query else []
-        if not terms:
+        if not query:
             self._visible_indices = list(range(len(self.files)))
-        else:
-            self._visible_indices = [
-                i for i, f in enumerate(self.files)
-                if all(t in f.label.lower() or t in f.path.lower() for t in terms)
-            ]
+            return
+        terms = query.split()
+        self._visible_indices = [
+            i for i, f in enumerate(self.files)
+            if all(t in f.label.lower() or t in f.path.lower() for t in terms)
+        ]
 
     def _initial_load(self):
         if not self.files:
@@ -983,85 +1005,200 @@ class TkivApp:
             self.redraw()
 
     # ---------------------------------------------------------- lazy scan
+    #
+    # Design notes
+    # ------------
+    # The scanner thread does the filesystem work and groups discovered
+    # paths into batches of LAZY_BATCH_SIZE.  Each batch is posted to the
+    # main queue via a single lambda.  On the main thread `_queue_lazy_files`
+    # buffers the batch into `_lazy_pending` and schedules a single
+    # `_commit_lazy_batch` via after_idle.  The commit itself performs only
+    # O(len(batch)) work (extend `files` / `tns_thumbs` / `_visible_indices`)
+    # and then schedules a single coalesced redraw.
+    #
+    # Net result: total scan cost is O(N) for the model updates plus
+    # O(1) redraws per queue drain, instead of O(N^2) from redrawing,
+    # re-filtering, and repopulating the listbox once per file.
+    #
     def start_lazy_scan(self, paths, recursive=False, sort_time=False):
         def worker():
             seen = set()
-            for path in paths:
-                if self._scan_cancel or self._quitting:
+            batch = []
+
+            def flush():
+                if not batch:
                     return
-                p = Path(path).expanduser()
-                try:
-                    p = p.resolve()
-                except Exception:
-                    continue
-                if not p.exists():
-                    continue
-                if p.is_dir():
-                    pattern = "**/*" if recursive else "*"
+                b = batch[:]
+                batch.clear()
+                self._post(lambda paths=b: self._queue_lazy_files(paths))
+
+            try:
+                for path in paths:
+                    if self._scan_cancel or self._quitting:
+                        return
+                    p = Path(path).expanduser()
                     try:
-                        entries = list(p.glob(pattern))
+                        p = p.resolve()
                     except Exception:
                         continue
-                    if sort_time:
-                        try:
-                            entries = sorted(
-                                entries,
-                                key=lambda x: x.stat().st_mtime,
-                                reverse=True)
-                        except OSError:
-                            pass
-                    else:
-                        entries = sorted(entries)
-                    for f in entries:
-                        if self._scan_cancel or self._quitting:
-                            return
-                        if f.suffix.lower() in IMAGE_EXTS:
-                            sp = str(f)
-                            if sp in seen:
-                                continue
-                            seen.add(sp)
-                            self._post(lambda fp=sp: self._add_lazy_file(fp))
-                elif p.is_file() and p.suffix.lower() in IMAGE_EXTS:
-                    sp = str(p)
-                    if sp in seen:
+                    if not p.exists():
                         continue
-                    seen.add(sp)
-                    self._post(lambda fp=sp: self._add_lazy_file(fp))
+                    if p.is_dir():
+                        pattern = "**/*" if recursive else "*"
+                        try:
+                            entries = list(p.glob(pattern))
+                        except Exception:
+                            continue
+                        if sort_time:
+                            try:
+                                entries = sorted(
+                                    entries,
+                                    key=lambda x: x.stat().st_mtime,
+                                    reverse=True)
+                            except OSError:
+                                pass
+                        else:
+                            entries = sorted(entries)
+                        for f in entries:
+                            if self._scan_cancel or self._quitting:
+                                return
+                            if f.suffix.lower() in IMAGE_EXTS:
+                                sp = str(f)
+                                if sp in seen:
+                                    continue
+                                seen.add(sp)
+                                batch.append(sp)
+                                if len(batch) >= LAZY_BATCH_SIZE:
+                                    flush()
+                    elif p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+                        sp = str(p)
+                        if sp in seen:
+                            continue
+                        seen.add(sp)
+                        batch.append(sp)
+                        if len(batch) >= LAZY_BATCH_SIZE:
+                            flush()
+            finally:
+                flush()
+                self._post(self._lazy_scan_finished)
+
         threading.Thread(target=worker, daemon=True,
                          name='tkiv-scan').start()
 
-    def _add_lazy_file(self, path):
+    def _queue_lazy_files(self, paths):
+        """Main-thread handler for a scanned batch.  Buffers paths and
+        schedules a single commit via after_idle."""
         if self._quitting:
             return
-        self.files.append(FileEntry(path))
-        self.tns_thumbs.append(None)
-        self._files_gen += 1
-        if self._sort_mode != SORT_NONE:
-            self._sort_dirty = True
-        self._rebuild_visible()
+        self._lazy_pending.extend(paths)
+        if not self._lazy_commit_pending:
+            self._lazy_commit_pending = True
+            self.root.after_idle(self._commit_lazy_batch)
 
-        # Invalidate the aspect cache while we are still gathering the
-        # sample images (mirrors sel_img.py).
-        if (self._gallery_aspect_opt is None
-                and len(self.files) <= GALLERY_ASPECT_SAMPLE):
-            self._gallery_aspect_cache = None
+    def _commit_lazy_batch(self):
+        """Append every buffered lazy path in one shot.
 
-        if len(self.files) == 1:
-            self.fileidx = 0
+        This is the O(1)-per-file hot path: we extend the parallel lists
+        and (when there is no active filter) extend `_visible_indices`
+        rather than rebuilding it.  Note that `_files_gen` is *not*
+        bumped here — appending does not shift existing indices, so
+        outstanding prefetch / thumbnail decodes remain valid.
+        """
+        self._lazy_commit_pending = False
+        if self._quitting:
+            return
+        paths = self._lazy_pending
+        self._lazy_pending = []
+        if not paths:
+            return
+
+        n_before = len(self.files)
+        first    = n_before == 0
+
+        new_entries = [FileEntry(p) for p in paths]
+        self.files.extend(new_entries)
+        self.tns_thumbs.extend([None] * len(new_entries))
+
+        if not self._filter_text:
+            # Fast path: no filter active, visible indices are contiguous.
+            self._visible_indices.extend(range(n_before, len(self.files)))
+        else:
+            self._rebuild_visible()
+
+        # While we are still gathering the aspect-ratio sample, drop the
+        # cached value so the auto-detection sees the new files.  Once we
+        # have at least GALLERY_ASPECT_SAMPLE files the cache is stable.
+        if self._gallery_aspect_opt is None:
+            n_after = len(self.files)
+            if (n_after <= GALLERY_ASPECT_SAMPLE
+                    or n_before < GALLERY_ASPECT_SAMPLE <= n_after):
+                self._gallery_aspect_cache = None
+
+        if first:
+            # First batch — honour --start-at now that we have a list.
+            self.fileidx = min(self._desired_start, len(self.files) - 1)
             self._persist_index()
             if self.mode == MODE_IMAGE:
-                self.load_image_async(0)
+                self.load_image_async(self.fileidx)
             elif self.mode == MODE_GALLERY:
-                self._pending_gallery_scroll = 0
-                self.redraw()
-            else:
-                self._populate_listbox()
-                self.redraw()
+                self._pending_gallery_scroll = self.fileidx
+
+        self._schedule_lazy_redraw()
+
+    def _schedule_lazy_redraw(self):
+        """Coalesce many batch commits into a single redraw."""
+        if self._lazy_needs_redraw:
+            return
+        self._lazy_needs_redraw = True
+        self.root.after_idle(self._do_lazy_redraw)
+
+    def _do_lazy_redraw(self):
+        """Incremental redraw used while a lazy scan is in progress.
+
+        For gallery mode the existing overscan-based renderer already
+        only touches visible tiles, so calling render_gallery() is cheap.
+        For list mode we deliberately skip the preview image (which
+        would decode a file on every redraw) and only keep the listbox
+        in sync; the full render_list() runs once the scan finishes.
+        """
+        self._lazy_needs_redraw = False
+        if self._quitting:
+            return
+        if self.mode == MODE_IMAGE:
+            self.update_info()
+        elif self.mode == MODE_GALLERY:
+            self.render_gallery()
+            self.update_info()
         else:
-            if self.mode in (MODE_GALLERY, MODE_LIST):
-                self.redraw()
-            elif self.mode == MODE_IMAGE:
-                self._prefetch_neighbors(self.fileidx)
+            self._populate_listbox()
+            self.update_info()
+
+    def _lazy_scan_finished(self):
+        """Called once the scanner thread has posted its last batch."""
+        # Flush anything still buffered (this also cancels the pending
+        # after_idle commit — the flag is cleared at the top of the method).
+        self._commit_lazy_batch()
+        if self._quitting:
+            return
+
+        # Sorting needs the complete list to be meaningful, so we defer
+        # it to the end of the scan.  _apply_sort() redraws on its own.
+        if self._sort_mode != SORT_NONE:
+            self._apply_sort()
+            return
+
+        if self.mode == MODE_IMAGE:
+            if not self.img_frames and self.files:
+                self.load_image_async(self.fileidx)
+            self.update_info()
+        elif self.mode == MODE_GALLERY:
+            self._pending_gallery_scroll = self.fileidx
+            self.render_gallery()
+            self.update_info()
+        else:
+            self._populate_listbox()
+            self.render_list()
+            self.update_info()
 
     # ---------------------------------------------------------- main-thread queue
     def _post(self, fn):
@@ -1995,24 +2132,36 @@ class TkivApp:
 
     # ---------------------------------------------------------- list rendering
     def _populate_listbox(self):
+        """Rebuild the listbox contents.
+
+        Two optimisations over the naive version:
+          * labels are inserted in chunks rather than one-by-one, and
+          * only marked items get per-item colour overrides, so the
+            common case (nothing marked) skips the itemconfig loop
+            entirely.  The Listbox defaults already match the unmarked
+            style.
+        """
         self.listbox.delete(0, END)
-        for i in self._visible_indices:
-            self.listbox.insert(END, self.files[i].label)
+        n = len(self._visible_indices)
+        if n == 0:
+            return
+
+        labels = [self.files[i].label for i in self._visible_indices]
+        for k in range(0, n, LISTBOX_INSERT_CHUNK):
+            self.listbox.insert(END, *labels[k:k + LISTBOX_INSERT_CHUNK])
+
         for pos, i in enumerate(self._visible_indices):
             if self.files[i].flags & FF_MARK:
                 self.listbox.itemconfig(pos, bg=THEME['selected_bg'],
                                         fg=THEME['selected_fg'])
-            else:
-                self.listbox.itemconfig(pos, bg=THEME['bg_secondary'],
-                                        fg=THEME['fg_text'])
-        if self._visible_indices:
-            if self.fileidx in self._visible_indices:
-                pos = self._visible_indices.index(self.fileidx)
-            else:
-                pos = 0
-            self.listbox.selection_clear(0, END)
-            self.listbox.select_set(pos)
-            self.listbox.see(pos)
+
+        if self.fileidx in self._visible_indices:
+            pos = self._visible_indices.index(self.fileidx)
+        else:
+            pos = 0
+        self.listbox.selection_clear(0, END)
+        self.listbox.select_set(pos)
+        self.listbox.see(pos)
 
     def _on_listbox_select(self, event=None):
         sel = self.listbox.curselection()
