@@ -12,32 +12,34 @@ Usage:
 
 Viewer keybindings (search bar is always focused; single-letter actions
 use Ctrl+):
-    q            Ctrl+Q        quit
+    Ctrl+Q        quit
     Tab          cycle mode (image -> gallery -> list -> image)
     Shift+Tab    reverse cycle
     Return       switch mode (image <-> gallery; list -> image)
     Esc          clear search if any, else quit
-    f            Ctrl+F        fullscreen
-    b            Ctrl+B        toggle status bar
-    r            Ctrl+R        reload
-    Ctrl+D       remove current file
-    n / p        Ctrl+N / Ctrl+P     next / previous (respects filter)
-    ] / [        Ctrl+] / Ctrl+[     +/- 10 files
-    g / G        Ctrl+Home / Ctrl+End  first / last
-    m            Ctrl+M        toggle mark
-    w / W / F    Ctrl+W / Ctrl+Shift+W / Ctrl+Shift+F   fit down/fit/fill
-    e / E        Ctrl+E / Ctrl+Shift+E   fit width / fit height
-    + / -        Ctrl++ / Ctrl+-        zoom in / out
+    Ctrl+F        fullscreen
+    Ctrl+B        toggle status bar
+    Ctrl+R        reload
+    Ctrl+D       remove current file (or all marked files if any are marked)
+    Ctrl+N / Ctrl+P     next / previous (respects filter)
+    Ctrl+] / Ctrl+[     +/- 10 files
+    Ctrl+Home / Ctrl+End  first / last
+    Ctrl+M        toggle mark
+    Ctrl+W / Ctrl+Shift+W / Ctrl+Shift+F   fit down/fit/fill
+    Ctrl+E / Ctrl+Shift+E   fit width / fit height
+    Ctrl++ / Ctrl+-        zoom in / out
     Ctrl+0       100%% zoom
-    z            Ctrl+Z        center image
-    h j k l      Ctrl+H/J/K/L  pan
+    Ctrl+Z        center image
+    Ctrl+H/J/K/L  pan
     Ctrl+Space   toggle animation
-    s            Ctrl+S        slideshow
-    < > ?        Ctrl+< / Ctrl+> / Ctrl+?  rotate
-    | _          Ctrl+| / Ctrl+_  flip
-    a / A        Ctrl+I / Ctrl+Shift+I  toggle antialias / alpha
-    ( )          Ctrl+( / Ctrl+)  contrast down/up
-    { }          Ctrl+{ / Ctrl+}  gamma down/up
+    Ctrl+S        slideshow
+    Ctrl+< / Ctrl+> / Ctrl+?  rotate
+    Ctrl+| / Ctrl+_  flip
+    Ctrl+I / Ctrl+Shift+I  toggle antialias / alpha
+    Ctrl+( / Ctrl+)  contrast down/up
+    Ctrl+{ / Ctrl+}  gamma down/up
+    Ctrl+Y        cycle sort (name / date / size)
+    Ctrl+Shift+Y  reverse sort direction
 """
 
 # ============================================================ imports
@@ -122,6 +124,12 @@ FF_MARK, FF_WARN = 1, 2
 DIR_LEFT, DIR_RIGHT, DIR_UP, DIR_DOWN = 1, 2, 4, 8
 DEGREE_90, DEGREE_180, DEGREE_270     = 1, 2, 3
 FLIP_HORIZONTAL, FLIP_VERTICAL        = 1, 2
+
+# Sorting
+SORT_NONE  = 'none'    # discovery order
+SORT_NAME  = 'name'    # natural (reverse=False) = A->Z
+SORT_MTIME = 'mtime'   # natural (reverse=False) = newest first
+SORT_SIZE  = 'size'    # natural (reverse=False) = largest first
 
 IMAGE_EXTS = {
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
@@ -436,6 +444,12 @@ def _add_shared_ui_options(p, mode):
                    help='include hidden files')
     p.add_argument('--time', action='store_true',
                    help='sort by modification time (newest first)')
+    p.add_argument('--sort', choices=('none', 'name', 'mtime', 'size'),
+                   default='none',
+                   help='initial sort order: none (discovery order), '
+                        'name (A-Z), mtime (newest first), size (largest first)')
+    p.add_argument('-R', '--sort-reverse', action='store_true',
+                   help='reverse the sort direction (e.g. Z-A, oldest first)')
     p.add_argument('-n', '--start-at', '--pass-idx',
                    type=int, default=1, dest='start_at',
                    help='start at index N (1-based)')
@@ -458,7 +472,7 @@ def build_viewer_parser():
         usage='%(prog)s [-abcgHhiopqrvZ0] [-A FRAMERATE] [-e WID] [-G GAMMA] '
               '[--geometry GEOMETRY] [-N NAME] [-n NUM] [-S DELAY] [-s MODE] '
               '[-T SIZE] [--gallery-rows N] [--gallery-cols N] '
-              '[--gallery-aspect N] FILES...')
+              '[--gallery-aspect N] [--sort MODE] [-R] FILES...')
     p.add_argument('-a', '--animate', action='store_true')
     p.add_argument('-A', '--framerate', type=int, default=0)
     p.add_argument('--assume-files', action='store_true')
@@ -590,6 +604,17 @@ class TkivApp:
         self.anti_alias = (getattr(opts, 'anti_alias', 'yes') != 'no')
         self.alpha_layer = (getattr(opts, 'alpha_layer', None) == 'yes')
 
+        # Sorting
+        sort_opt = (getattr(opts, 'sort', 'none') or 'none').lower()
+        self._sort_mode = {
+            'none':  SORT_NONE,
+            'name':  SORT_NAME,
+            'mtime': SORT_MTIME,
+            'size':  SORT_SIZE,
+        }.get(sort_opt, SORT_NONE)
+        self._sort_reverse = bool(getattr(opts, 'sort_reverse', False))
+        self._sort_dirty   = False
+
         if getattr(opts, 'zoom_100', False):
             self.scalemode, self.zoom = SCALE_ZOOM, 1.0
         elif getattr(opts, 'zoom', 0) > 0:
@@ -647,6 +672,8 @@ class TkivApp:
 
         self._setup_ui()
         self._setup_bindings()
+        if self._sort_mode != SORT_NONE:
+            self._apply_sort(refresh=False)
         self._persist_index()
         self.root.after(50, self._initial_load)
         self.root.after(500, self._poll_autoreload)
@@ -853,6 +880,7 @@ class TkivApp:
             's':            self.act_slideshow,
             'u':            self.act_unmark_all,
             'w':            lambda: self.act_fit(SCALE_DOWN),
+            'y':            self.act_sort_cycle,
             'z':            self.act_scroll_center,
             'space':        self.act_toggle_animation,
             '0':            self._key_zoom_100,
@@ -884,6 +912,7 @@ class TkivApp:
         e.bind('<Control-Shift-F>', self._mk_break(lambda: self.act_fit(SCALE_FILL)))
         e.bind('<Control-Shift-E>', self._mk_break(lambda: self.act_fit(SCALE_HEIGHT)))
         e.bind('<Control-Shift-I>', self._mk_break(self.act_toggle_alpha))
+        e.bind('<Control-Shift-Y>', self._mk_break(self.act_sort_reverse))
 
         for b in (1, 2, 3, 4, 5):
             self.canvas.bind(f'<ButtonPress-{b}>',
@@ -1007,6 +1036,8 @@ class TkivApp:
         self.files.append(FileEntry(path))
         self.tns_thumbs.append(None)
         self._files_gen += 1
+        if self._sort_mode != SORT_NONE:
+            self._sort_dirty = True
         self._rebuild_visible()
 
         # Invalidate the aspect cache while we are still gathering the
@@ -1049,6 +1080,12 @@ class TkivApp:
                 except Exception:
                     pass
                 processed += 1
+            if self._sort_dirty:
+                self._sort_dirty = False
+                try:
+                    self._apply_sort()
+                except Exception:
+                    pass
             self.root.after(QUEUE_POLL_MS, self._poll_main_queue)
         except tk.TclError:
             pass
@@ -1070,6 +1107,140 @@ class TkivApp:
         if name in self._timeout_ids:
             self.root.after_cancel(self._timeout_ids[name])
             del self._timeout_ids[name]
+
+    # ---------------------------------------------------------- sorting
+    def _sort_keyfunc(self, mode):
+        if mode == SORT_NAME:
+            return lambda f: f.label.lower()
+        if mode == SORT_MTIME:
+            def k(f):
+                try:
+                    return os.path.getmtime(f.path)
+                except OSError:
+                    return 0.0
+            return k
+        if mode == SORT_SIZE:
+            def k(f):
+                try:
+                    return os.path.getsize(f.path)
+                except OSError:
+                    return 0
+            return k
+        return None
+
+    def _apply_sort(self, mode=None, reverse=None, refresh=True):
+        """Reorder self.files (and self.tns_thumbs) in place.
+
+        Preserves the current file by path.  `refresh=False` skips the
+        post-sort reload/redraw (used at startup before the first image
+        load).
+        """
+        if mode is not None:
+            self._sort_mode = mode
+        if reverse is not None:
+            self._sort_reverse = reverse
+
+        if self._sort_mode == SORT_NONE or not self.files:
+            return
+
+        keyfunc = self._sort_keyfunc(self._sort_mode)
+        if keyfunc is None:
+            return
+
+        cur_path = None
+        if 0 <= self.fileidx < len(self.files):
+            cur_path = self.files[self.fileidx].path
+
+        # For MTIME/SIZE the natural presentation is "biggest / newest
+        # first", i.e. a descending sort.  sorted() ascends by default,
+        # so flip the flag.
+        rev = self._sort_reverse
+        if self._sort_mode in (SORT_MTIME, SORT_SIZE):
+            rev = not rev
+
+        paired = list(zip(self.files, self.tns_thumbs))
+        try:
+            paired.sort(key=lambda p: keyfunc(p[0]), reverse=rev)
+        except Exception:
+            return
+        self.files      = [p[0] for p in paired]
+        self.tns_thumbs = [p[1] for p in paired]
+
+        # Restore the current file by path.
+        if cur_path is not None:
+            for i, f in enumerate(self.files):
+                if f.path == cur_path:
+                    self.fileidx = i
+                    break
+            else:
+                self.fileidx = max(0, min(self.fileidx, len(self.files) - 1))
+        if self.fileidx >= len(self.files):
+            self.fileidx = max(0, len(self.files) - 1)
+        self.markidx   = self.fileidx
+        self.alternate = self.fileidx
+
+        # Every index-keyed cache is now stale.
+        self._files_gen += 1
+        self._load_token += 1
+        self._prefetch_cache.clear()
+        self._img_in_flight.clear()
+        self._gallery_in_flight.clear()
+        self._mtimes.clear()
+
+        self._rebuild_visible()
+        self._persist_index()
+
+        if not refresh:
+            return
+        if self.mode == MODE_IMAGE:
+            self.load_image_async(self.fileidx)
+        else:
+            self._pending_gallery_scroll = self.fileidx
+            if self.mode == MODE_LIST:
+                self._populate_listbox()
+            self.redraw()
+
+    def _sort_label(self):
+        """Short 'name^' / 'datev' / 'sizev' label for the status bar."""
+        if self._sort_mode == SORT_NONE:
+            return ''
+        name = {SORT_NAME: 'name',
+                SORT_MTIME: 'date',
+                SORT_SIZE: 'size'}.get(self._sort_mode, '')
+        if not name:
+            return ''
+        if self._sort_mode == SORT_NAME:
+            ascending = not self._sort_reverse
+        else:
+            ascending = self._sort_reverse
+        arrow = '\u2191' if ascending else '\u2193'
+        return name + arrow
+
+    def act_sort_cycle(self):
+        """Ctrl+Y: cycle name-up -> name-down -> date-down -> date-up ->
+        size-down -> size-up -> ..."""
+        cycle = [
+            (SORT_NAME,  False),
+            (SORT_NAME,  True),
+            (SORT_MTIME, False),
+            (SORT_MTIME, True),
+            (SORT_SIZE,  False),
+            (SORT_SIZE,  True),
+        ]
+        cur = (self._sort_mode, self._sort_reverse)
+        try:
+            idx = cycle.index(cur)
+        except ValueError:
+            idx = -1
+        mode, rev = cycle[(idx + 1) % len(cycle)]
+        self._apply_sort(mode, rev)
+
+    def act_sort_reverse(self):
+        """Ctrl+Shift+Y: flip the current sort direction (or start name sort)."""
+        if self._sort_mode == SORT_NONE:
+            self._apply_sort(SORT_NAME, False)
+        else:
+            self._apply_sort(self._sort_mode, not self._sort_reverse)
 
     # ---------------------------------------------------------- files
     def remove_file(self, n, manual):
@@ -1931,12 +2102,15 @@ class TkivApp:
         if self.fileidx in self._visible_indices:
             vis_pos = self._visible_indices.index(self.fileidx) + 1
 
+        sl = self._sort_label()
+        suffix = f"  [{sl}]" if sl else ""
+
         if self.mode == MODE_GALLERY or self.mode == MODE_LIST:
             if self._filter_text:
                 text = (f"{mark}{vis_pos:0{fw}d}/{cnt_vis} "
-                        f"({cnt_all})  {name}")
+                        f"({cnt_all}){suffix}  {name}")
             else:
-                text = f"{mark}{self.fileidx + 1:0{fw}d}/{cnt_all}  {name}"
+                text = f"{mark}{self.fileidx + 1:0{fw}d}/{cnt_all}{suffix}  {name}"
         else:
             parts = []
             if self.ss_on:
@@ -1952,6 +2126,8 @@ class TkivApp:
                 parts.append(f"{vis_pos}/{cnt_vis} ({cnt_all})")
             else:
                 parts.append(f"{self.fileidx + 1:0{fw}d}/{cnt_all}")
+            if sl:
+                parts.append(sl)
             text = f"{mark}{'  '.join(parts)}  {name}"
         self.status.config(text=text)
 
@@ -2212,14 +2388,33 @@ class TkivApp:
     def act_remove(self):
         if not self.files:
             return
-        if self.remove_file(self.fileidx, True):
-            if self.mode == MODE_IMAGE:
-                self.load_image_async(self.fileidx)
-            else:
-                self._pending_gallery_scroll = self.fileidx
-                if self.mode == MODE_LIST:
-                    self._populate_listbox()
-                self.redraw()
+
+        # If any files are marked, remove all of them; otherwise just the
+        # current one.  Delete from highest index to lowest so that indices
+        # of files still to be removed are not shifted underneath us.
+        marked_indices = [i for i, f in enumerate(self.files) if f.flags & FF_MARK]
+        if not marked_indices:
+            marked_indices = [self.fileidx]
+
+        for i in sorted(marked_indices, reverse=True):
+            if not self.remove_file(i, True):
+                # remove_file triggered quit() (e.g. last file removed).
+                return
+
+        # remove_file() already adjusted fileidx for each deletion, but clamp
+        # defensively in case the current file was among those removed.
+        if self.fileidx >= len(self.files):
+            self.fileidx = len(self.files) - 1
+        if self.fileidx < 0:
+            self.fileidx = 0
+
+        if self.mode == MODE_IMAGE:
+            self.load_image_async(self.fileidx)
+        else:
+            self._pending_gallery_scroll = self.fileidx
+            if self.mode == MODE_LIST:
+                self._populate_listbox()
+            self.redraw()
 
     def _mark(self, n, on):
         if 0 <= n < len(self.files):
@@ -2505,7 +2700,7 @@ def run_viewer():
         print("  Ctrl+F           fullscreen")
         print("  Ctrl+B           toggle bar")
         print("  Ctrl+R           reload")
-        print("  Ctrl+D           remove file")
+        print("  Ctrl+D           remove current or marked files")
         print("  Ctrl+N / Ctrl+P  next / previous (respects filter)")
         print("  Ctrl+H/J/K/L     pan")
         print("  Ctrl++ / Ctrl+-  zoom (image) / tile size (gallery)")
@@ -2515,6 +2710,7 @@ def run_viewer():
         print("  Ctrl+Space       toggle animation")
         print("  Ctrl+E           fit width   Ctrl+W  fit-down")
         print("  Ctrl+Shift+W     fit         Ctrl+Shift+F  fill")
+        print("  Ctrl+Y / Ctrl+Shift+Y  cycle sort / reverse sort")
         print("\nOptions:")
         print("  -g/-t, --gallery            start in gallery mode")
         print("  -T N,  --gallery-tile-size  gallery tile size in pixels")
@@ -2523,6 +2719,8 @@ def run_viewer():
         print("  --gallery-aspect N          tile width/height ratio "
               "(default: auto-detect)")
         print("  --lazy                      populate file list as it is scanned")
+        print("  --sort MODE                 initial sort: name, mtime, size, none")
+        print("  -R, --sort-reverse          reverse the sort direction")
         return 0
 
     if args.version:
@@ -2606,6 +2804,7 @@ def run_selector():
         print("\nKey bindings match the viewer. Press Return to accept and print,")
         print("Esc to cancel. Ctrl+M (or Ctrl+Enter) toggles a mark; when any")
         print("file is marked, all marked files are printed on accept.")
+        print("Ctrl+Y / Ctrl+Shift+Y  cycle sort / reverse sort")
         return 0
 
     if args.version:
