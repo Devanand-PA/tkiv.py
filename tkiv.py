@@ -48,6 +48,14 @@ Direct-key mode (--no-searchbar / F2):
     <key> (and Shift+Ctrl+<key> to Shift+<key>).  Navigation keys
     (arrows, Tab, Return, Esc, Delete, PageUp/Down, Home/End) behave the
     same as always.  F2 switches back.
+
+Configuration file:
+    ~/.config/tkiv.py/config  (or $XDG_CONFIG_HOME/tkiv.py/config)
+
+    Uses an INI-like format with three optional sections: [keys], [theme],
+    and [behavior].  Any syntax error causes the whole config to be
+    discarded and defaults used.  See program source for the list of
+    configurable keys/colors/behaviors.
 """
 
 # ============================================================ imports
@@ -55,6 +63,7 @@ import argparse
 import hashlib
 import os
 import queue
+import re
 import stat
 import sys
 import threading
@@ -182,6 +191,299 @@ DECODE_WORKERS = max(2, min(8, os.cpu_count() or 4))
 DISK_CACHE_ENABLED = True
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "tkiv_thumbs"
 CACHE_WEBP_QUALITY = 82
+
+
+# ============================================================ config file
+CONFIG_DIR = Path(
+    os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+).expanduser() / "tkiv.py"
+CONFIG_FILE = CONFIG_DIR / "config"
+
+# ------------------------------------------------------------------
+# Default action -> list-of-bindings mapping.  Bindings use the
+# human-friendly "Ctrl+Shift+W" syntax, which is translated to Tk
+# sequences (<Control-Shift-w>) at bind time.  In direct-key mode the
+# Ctrl/Alt/Meta modifiers are stripped (and Shift+letter becomes an
+# uppercase letter), matching the behaviour of the built-in bindings.
+# ------------------------------------------------------------------
+DEFAULT_KEYS = {
+    'quit':             ['Ctrl+Q'],
+    'toggle_bar':       ['Ctrl+B'],
+    'remove':           ['Ctrl+D'],
+    'fit_width':        ['Ctrl+E'],
+    'fullscreen':       ['Ctrl+F'],
+    'first':            ['Ctrl+G'],
+    'pan_left':         ['Ctrl+H'],
+    'toggle_antialias': ['Ctrl+I'],
+    'pan_down':         ['Ctrl+J'],
+    'pan_up':           ['Ctrl+K'],
+    'pan_right':        ['Ctrl+L'],
+    'toggle_mark':      ['Ctrl+M'],
+    'next':             ['Ctrl+N'],
+    'prev':             ['Ctrl+P'],
+    'reload':           ['Ctrl+R'],
+    'slideshow':        ['Ctrl+S'],
+    'unmark_all':       ['Ctrl+U'],
+    'fit_down':         ['Ctrl+W'],
+    'sort_cycle':       ['Ctrl+Y'],
+    'center':           ['Ctrl+Z'],
+    'animate':          ['Ctrl+Space'],
+    'zoom_100':         ['Ctrl+0'],
+    'zoom_in':          ['Ctrl+Plus'],
+    'zoom_out':         ['Ctrl+Minus'],
+    'nav_10_forward':   ['Ctrl+BracketRight'],
+    'nav_10_back':      ['Ctrl+BracketLeft'],
+    'gamma_down':       ['Ctrl+BraceLeft'],
+    'gamma_up':         ['Ctrl+BraceRight'],
+    'contrast_down':    ['Ctrl+ParenLeft'],
+    'contrast_up':      ['Ctrl+ParenRight'],
+    'rotate_left':      ['Ctrl+Less'],
+    'rotate_right':     ['Ctrl+Greater'],
+    'rotate_180':       ['Ctrl+Question'],
+    'flip_h':           ['Ctrl+Bar'],
+    'flip_v':           ['Ctrl+Underscore'],
+    'fit':              ['Ctrl+Shift+W'],
+    'fill':             ['Ctrl+Shift+F'],
+    'fit_height':       ['Ctrl+Shift+E'],
+    'toggle_alpha':     ['Ctrl+Shift+I'],
+    'sort_reverse':     ['Ctrl+Shift+Y'],
+    'toggle_searchbar': ['F2'],
+}
+
+# Behaviour values exposed in the config file.  Anything not listed here
+# is hard-coded.
+DEFAULT_BEHAVIOR = {
+    'slideshow_delay': SLIDESHOW_DELAY,   # seconds between slideshow frames
+    'max_load_dim':    MAX_LOAD_DIM,      # max dimension for full image decode
+}
+
+_VALID_THEME_KEYS = set(THEME.keys())
+_HEX_COLOR_RE = re.compile(r'^#[0-9a-fA-F]{6}$')
+
+_MOD_ALIASES = {
+    'ctrl': 'Control', 'control': 'Control',
+    'shift': 'Shift',
+    'alt': 'Alt',
+    'meta': 'Meta', 'cmd': 'Meta', 'super': 'Meta', 'command': 'Meta',
+}
+
+# Key-name aliases.  Values preserve the exact Tk keysym case.
+_KEY_ALIASES = {
+    'space': 'space',
+    'plus': 'plus', '+': 'plus',
+    'minus': 'minus', '-': 'minus',
+    'equal': 'equal', '=': 'equal',
+    'bracketleft': 'bracketleft', '[': 'bracketleft',
+    'bracketright': 'bracketright', ']': 'bracketright',
+    'braceleft': 'braceleft', '{': 'braceleft',
+    'braceright': 'braceright', '}': 'braceright',
+    'parenleft': 'parenleft', '(': 'parenleft',
+    'parenright': 'parenright', ')': 'parenright',
+    'less': 'less', '<': 'less',
+    'greater': 'greater', '>': 'greater',
+    'question': 'question', '?': 'question',
+    'bar': 'bar', '|': 'bar',
+    'underscore': 'underscore', '_': 'underscore',
+    'return': 'Return', 'enter': 'Return',
+    'escape': 'Escape', 'esc': 'Escape',
+    'tab': 'Tab',
+    'backspace': 'BackSpace', 'bs': 'BackSpace',
+    'delete': 'Delete', 'del': 'Delete',
+    'home': 'Home', 'end': 'End',
+    'pageup': 'Prior', 'pgup': 'Prior', 'prior': 'Prior',
+    'pagedown': 'Next', 'pgdn': 'Next', 'next': 'Next',
+    'up': 'Up', 'down': 'Down', 'left': 'Left', 'right': 'Right',
+    'insert': 'Insert', 'ins': 'Insert',
+    'pause': 'Pause', 'print': 'Print',
+    'kp_add': 'KP_Add', 'kp_subtract': 'KP_Subtract',
+    'kp_enter': 'KP_Enter', 'kp_multiply': 'KP_Multiply',
+    'kp_divide': 'KP_Divide', 'kp_decimal': 'KP_Decimal',
+    'kp_0': 'KP_0', 'kp_1': 'KP_1', 'kp_2': 'KP_2',
+    'kp_3': 'KP_3', 'kp_4': 'KP_4', 'kp_5': 'KP_5',
+    'kp_6': 'KP_6', 'kp_7': 'KP_7', 'kp_8': 'KP_8',
+    'kp_9': 'KP_9',
+}
+for _i in range(1, 13):
+    _KEY_ALIASES['f%d' % _i] = 'F%d' % _i
+del _i
+
+
+def _split_key_spec(spec):
+    """Split 'Ctrl+Shift+W' into ['Ctrl', 'Shift', 'W'].
+
+    Handles a trailing/embedded '+' key specially so that 'Ctrl++' works.
+    """
+    parts = []
+    cur = ''
+    for ch in spec:
+        if ch == '+':
+            if cur:
+                parts.append(cur)
+                cur = ''
+            else:
+                # A '+' key in its own right (e.g. from 'Ctrl++').
+                parts.append('+')
+        else:
+            cur += ch
+    if cur:
+        parts.append(cur)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _parse_key_spec(spec):
+    """Translate a human-friendly spec like 'Ctrl+Shift+W' into a Tk
+    sequence like '<Control-Shift-w>'.  Returns None on error."""
+    if not isinstance(spec, str):
+        return None
+    parts = _split_key_spec(spec)
+    if not parts:
+        return None
+    mods = []
+    key = None
+    for p in parts:
+        low = p.lower()
+        if low in _MOD_ALIASES:
+            m = _MOD_ALIASES[low]
+            if m not in mods:
+                mods.append(m)
+        else:
+            if key is not None:
+                return None  # two non-modifier keys
+            key = p
+    if key is None:
+        return None
+    klow = key.lower()
+    if klow in _KEY_ALIASES:
+        key_name = _KEY_ALIASES[klow]
+    elif len(key) == 1:
+        # Single character (letter or digit).  Tk treats these as
+        # case-insensitive when a Shift modifier is present, so we
+        # normalise letters to lowercase.
+        key_name = key.lower() if key.isalpha() else key
+    else:
+        return None
+    return '<' + ''.join(m + '-' for m in mods) + key_name + '>'
+
+
+def _to_direct_key(tk_seq):
+    """Given a Tk sequence for the search-bar mode, produce the
+    corresponding direct-key sequence by dropping Control/Alt/Meta and
+    uppercasing letters that had Shift.  Returns None on error."""
+    if not (tk_seq.startswith('<') and tk_seq.endswith('>')):
+        return None
+    inner = tk_seq[1:-1]
+    if not inner:
+        return None
+    parts = inner.split('-')
+    key = parts[-1]
+    mods = parts[:-1]
+    keep_shift = 'Shift' in mods
+    if len(key) == 1 and key.isalpha() and keep_shift:
+        return '<' + key.upper() + '>'
+    if len(key) == 1 and key.isalpha():
+        return '<' + key.lower() + '>'
+    if keep_shift:
+        return '<Shift-' + key + '>'
+    return '<' + key + '>'
+
+
+def _validate_color(s):
+    return bool(_HEX_COLOR_RE.match(s))
+
+
+def _parse_config_text(text):
+    """Parse config text.  Raises ValueError on any problem."""
+    cfg = {'keys': {}, 'theme': {}, 'behavior': {}}
+    section = None
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            name = line[1:-1].strip().lower()
+            if name not in ('keys', 'theme', 'behavior'):
+                raise ValueError(
+                    "line %d: unknown section [%s]" % (lineno, name))
+            section = name
+            continue
+        if section is None:
+            raise ValueError(
+                "line %d: key outside of any section" % lineno)
+        if '=' not in line:
+            raise ValueError(
+                "line %d: expected 'key = value'" % lineno)
+        key, _, val = line.partition('=')
+        key = key.strip()
+        val = val.strip()
+        if not key:
+            raise ValueError("line %d: empty key" % lineno)
+        if section == 'keys':
+            if key not in DEFAULT_KEYS:
+                raise ValueError(
+                    "line %d: unknown action '%s'" % (lineno, key))
+            if _parse_key_spec(val) is None:
+                raise ValueError(
+                    "line %d: invalid key sequence '%s'" % (lineno, val))
+            cfg['keys'].setdefault(key, []).append(val)
+        elif section == 'theme':
+            if key not in _VALID_THEME_KEYS:
+                raise ValueError(
+                    "line %d: unknown theme key '%s'" % (lineno, key))
+            if not _validate_color(val):
+                raise ValueError(
+                    "line %d: invalid color '%s'" % (lineno, val))
+            cfg['theme'][key] = val
+        else:  # behavior
+            if key not in DEFAULT_BEHAVIOR:
+                raise ValueError(
+                    "line %d: unknown behavior '%s'" % (lineno, key))
+            if key in ('slideshow_delay', 'max_load_dim'):
+                try:
+                    iv = int(val)
+                except ValueError:
+                    raise ValueError(
+                        "line %d: %s must be an integer" % (lineno, key))
+                if iv <= 0:
+                    raise ValueError(
+                        "line %d: %s must be positive" % (lineno, key))
+                cfg['behavior'][key] = iv
+            else:
+                raise ValueError(
+                    "line %d: unhandled behavior '%s'" % (lineno, key))
+    return cfg
+
+
+_CONFIG_CACHE = None
+
+
+def _get_config():
+    """Load the config file once.  Always returns a dict with 'keys',
+    'theme' and 'behavior' sub-dicts.  On any syntax error the whole
+    config is discarded and an empty config (i.e. defaults) is used."""
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None:
+        return _CONFIG_CACHE
+    empty = {'keys': {}, 'theme': {}, 'behavior': {}}
+    if not CONFIG_FILE.exists():
+        _CONFIG_CACHE = empty
+        return empty
+    try:
+        text = CONFIG_FILE.read_text()
+    except OSError as e:
+        sys.stderr.write(
+            "%s: cannot read config %s: %s; using defaults\n"
+            % (PROGNAME, CONFIG_FILE, e))
+        _CONFIG_CACHE = empty
+        return empty
+    try:
+        cfg = _parse_config_text(text)
+    except ValueError as e:
+        sys.stderr.write(
+            "%s: config error: %s; using defaults\n" % (PROGNAME, e))
+        _CONFIG_CACHE = empty
+        return empty
+    _CONFIG_CACHE = cfg
+    return cfg
 
 
 # ============================================================ helpers
@@ -585,6 +887,19 @@ class TkivApp:
         self._bound_target = None
         self._bound_seqs = []
 
+        # ---- configuration ------------------------------------------
+        self._cfg = _get_config()
+        self._key_bindings = {k: list(v) for k, v in DEFAULT_KEYS.items()}
+        for k, v in self._cfg['keys'].items():
+            self._key_bindings[k] = list(v)
+        self._behavior = dict(DEFAULT_BEHAVIOR)
+        self._behavior.update(self._cfg['behavior'])
+        self._max_load_dim = int(self._behavior['max_load_dim'])
+        # Apply theme overrides before any UI code reads THEME.
+        for k, v in self._cfg['theme'].items():
+            THEME[k] = v
+        # --------------------------------------------------------------
+
         self.files = list(files)
         if not self.files and not getattr(opts, 'lazy', False):
             raise SystemExit("no files")
@@ -657,7 +972,7 @@ class TkivApp:
         ss_delay = getattr(opts, 'ss_delay', 0.0)
         self.ss_on    = ss_delay > 0
         self.ss_delay = (int(ss_delay * 10) if ss_delay > 0
-                         else SLIDESHOW_DELAY * 10)
+                         else int(self._behavior['slideshow_delay']) * 10)
 
         # Gallery state
         self.tns_thumbs = [None] * len(self.files)
@@ -897,6 +1212,52 @@ class TkivApp:
         self.root.protocol('WM_DELETE_WINDOW',
                            lambda: self.quit(1 if self.purpose == 'select' else 0))
 
+    # Map every configurable action name to a zero-argument callable.
+    def _action_fns(self):
+        return {
+            'quit':             self.quit,
+            'toggle_bar':       self.act_toggle_bar,
+            'remove':           self.act_remove,
+            'fit_width':        lambda: self.act_fit(SCALE_WIDTH),
+            'fullscreen':       self.act_toggle_fullscreen,
+            'first':            self.act_first,
+            'pan_left':         lambda: self._key_nav(DIR_LEFT),
+            'toggle_antialias': self.act_toggle_antialias,
+            'pan_down':         lambda: self._key_nav(DIR_DOWN),
+            'pan_up':           lambda: self._key_nav(DIR_UP),
+            'pan_right':        lambda: self._key_nav(DIR_RIGHT),
+            'toggle_mark':      self.act_toggle_mark,
+            'next':             self._key_next,
+            'prev':             self._key_prev,
+            'reload':           self.act_reload,
+            'slideshow':        self.act_slideshow,
+            'unmark_all':       self.act_unmark_all,
+            'fit_down':         lambda: self.act_fit(SCALE_DOWN),
+            'sort_cycle':       self.act_sort_cycle,
+            'center':           self.act_scroll_center,
+            'animate':          self.act_toggle_animation,
+            'zoom_100':         self._key_zoom_100,
+            'zoom_in':          lambda: self.act_zoom(1),
+            'zoom_out':         lambda: self.act_zoom(-1),
+            'nav_10_forward':   lambda: self.act_navigate(10),
+            'nav_10_back':      lambda: self.act_navigate(-10),
+            'gamma_down':       lambda: self.act_gamma(-1),
+            'gamma_up':         lambda: self.act_gamma(1),
+            'contrast_down':    lambda: self.act_contrast(-1),
+            'contrast_up':      lambda: self.act_contrast(1),
+            'rotate_left':      lambda: self.act_rotate(DEGREE_270),
+            'rotate_right':     lambda: self.act_rotate(DEGREE_90),
+            'rotate_180':       lambda: self.act_rotate(DEGREE_180),
+            'flip_h':           lambda: self.act_flip(FLIP_HORIZONTAL),
+            'flip_v':           lambda: self.act_flip(FLIP_VERTICAL),
+            'fit':              lambda: self.act_fit(SCALE_FIT),
+            'fill':             lambda: self.act_fit(SCALE_FILL),
+            'fit_height':       lambda: self.act_fit(SCALE_HEIGHT),
+            'toggle_alpha':     self.act_toggle_alpha,
+            'sort_reverse':     self.act_sort_reverse,
+            'toggle_searchbar': self.act_toggle_searchbar,
+        }
+
     def _setup_key_bindings(self):
         for seq in self._bound_seqs:
             for tgt in (self.root, self.search_entry):
@@ -912,10 +1273,8 @@ class TkivApp:
 
         if self.no_searchbar:
             target = self.root
-            ctrl   = ''
         else:
             target = self.search_entry
-            ctrl   = 'Control-'
         self._bound_target = target
 
         def _b(seq, fn):
@@ -925,7 +1284,7 @@ class TkivApp:
             except tk.TclError:
                 pass
 
-        # navigation
+        # ----- navigation (not configurable) -----
         _b('<Up>',    lambda: self._key_nav(DIR_UP))
         _b('<Down>',  lambda: self._key_nav(DIR_DOWN))
         _b('<Left>',  lambda: self._key_nav(DIR_LEFT))
@@ -935,7 +1294,7 @@ class TkivApp:
         _b('<Home>',  self.act_first)
         _b('<End>',   self.act_last)
 
-        # mode / accept / cancel
+        # ----- mode / accept / cancel -----
         _b('<Tab>',          lambda: self._cycle_mode(1))
         _b('<Shift-Tab>',    lambda: self._cycle_mode(-1))
         _b('<ISO_Left_Tab>', lambda: self._cycle_mode(-1))
@@ -944,67 +1303,25 @@ class TkivApp:
         _b('<Escape>',       self._key_escape)
         _b('<Delete>',       self._key_delete)
 
-        # F2 toggles searchbar/direct-key mode
-        _b('<F2>', self.act_toggle_searchbar)
+        # ----- configurable bindings -----
+        action_fns = self._action_fns()
+        for action, specs in self._key_bindings.items():
+            fn = action_fns.get(action)
+            if fn is None:
+                continue
+            for spec in specs:
+                tk_seq = _parse_key_spec(spec)
+                if tk_seq is None:
+                    continue
+                if self.no_searchbar:
+                    tk_seq = _to_direct_key(tk_seq)
+                    if tk_seq is None:
+                        continue
+                _b(tk_seq, fn)
 
-        ctrl_bindings = {
-            'q':            self.quit,
-            'b':            self.act_toggle_bar,
-            'd':            self.act_remove,
-            'e':            lambda: self.act_fit(SCALE_WIDTH),
-            'f':            self.act_toggle_fullscreen,
-            'g':            self.act_first,
-            'h':            lambda: self._key_nav(DIR_LEFT),
-            'i':            self.act_toggle_antialias,
-            'j':            lambda: self._key_nav(DIR_DOWN),
-            'k':            lambda: self._key_nav(DIR_UP),
-            'l':            lambda: self._key_nav(DIR_RIGHT),
-            'm':            self.act_toggle_mark,
-            'n':            self._key_next,
-            'p':            self._key_prev,
-            'r':            self.act_reload,
-            's':            self.act_slideshow,
-            'u':            self.act_unmark_all,
-            'w':            lambda: self.act_fit(SCALE_DOWN),
-            'y':            self.act_sort_cycle,
-            'z':            self.act_scroll_center,
-            'space':        self.act_toggle_animation,
-            '0':            self._key_zoom_100,
-            'plus':         lambda: self.act_zoom(1),
-            'equal':        lambda: self.act_zoom(1),
-            'minus':        lambda: self.act_zoom(-1),
-            'KP_Add':       lambda: self.act_zoom(1),
-            'KP_Subtract':  lambda: self.act_zoom(-1),
-            'bracketright': lambda: self.act_navigate(10),
-            'bracketleft':  lambda: self.act_navigate(-10),
-            'braceleft':    lambda: self.act_gamma(-1),
-            'braceright':   lambda: self.act_gamma(1),
-            'parenleft':    lambda: self.act_contrast(-1),
-            'parenright':   lambda: self.act_contrast(1),
-            'less':         lambda: self.act_rotate(DEGREE_270),
-            'greater':      lambda: self.act_rotate(DEGREE_90),
-            'question':     lambda: self.act_rotate(DEGREE_180),
-            'bar':          lambda: self.act_flip(FLIP_HORIZONTAL),
-            'underscore':   lambda: self.act_flip(FLIP_VERTICAL),
-        }
-        for key, fn in ctrl_bindings.items():
-            _b(f'<{ctrl}{key}>', fn)
-
+        # Ctrl+Enter as an alternative mark toggle in search-bar mode.
         if not self.no_searchbar:
             _b('<Control-Return>', self.act_toggle_mark)
-
-        if self.no_searchbar:
-            _b('<W>', lambda: self.act_fit(SCALE_FIT))
-            _b('<F>', lambda: self.act_fit(SCALE_FILL))
-            _b('<E>', lambda: self.act_fit(SCALE_HEIGHT))
-            _b('<I>', self.act_toggle_alpha)
-            _b('<Y>', self.act_sort_reverse)
-        else:
-            _b('<Control-Shift-W>', lambda: self.act_fit(SCALE_FIT))
-            _b('<Control-Shift-F>', lambda: self.act_fit(SCALE_FILL))
-            _b('<Control-Shift-E>', lambda: self.act_fit(SCALE_HEIGHT))
-            _b('<Control-Shift-I>', self.act_toggle_alpha)
-            _b('<Control-Shift-Y>', self.act_sort_reverse)
 
         if not self.no_searchbar:
             try:
@@ -1502,7 +1819,7 @@ class TkivApp:
                 break
             path = self.files[n].path
             try:
-                frames, delays = load_frames(path, max_dim=MAX_LOAD_DIM)
+                frames, delays = load_frames(path, max_dim=self._max_load_dim)
             except Exception as e:
                 if not getattr(self.opts, 'quiet', False):
                     sys.stderr.write(f"{PROGNAME}: {path}: {e}\n")
@@ -1571,7 +1888,8 @@ class TkivApp:
         fut = self._img_in_flight.get(n)
         if fut is None:
             path = self.files[n].path
-            fut = self._img_executor.submit(load_frames, path, MAX_LOAD_DIM)
+            fut = self._img_executor.submit(
+                load_frames, path, self._max_load_dim)
             self._img_in_flight[n] = fut
             def _clear(f, _n=n):
                 self._img_in_flight.pop(_n, None)
@@ -2867,6 +3185,16 @@ def run_viewer():
         print("  Ctrl+Y / Ctrl+Shift+Y  cycle sort / reverse sort")
         print("\nDirect-key mode (--no-searchbar or F2): the search bar is")
         print("hidden and every Ctrl+<key> action is rebound to plain <key>.")
+        print("\nConfig file: ~/.config/tkiv.py/config  "
+              "(or $XDG_CONFIG_HOME/tkiv.py/config)")
+        print("  INI-like sections: [keys], [theme], [behavior].")
+        print("  Example:")
+        print("    [keys]")
+        print("    next = Ctrl+N")
+        print("    next = Space         # multiple bindings per action")
+        print("    [behavior]")
+        print("    slideshow_delay = 5")
+        print("  Any syntax error causes the whole config to be ignored.")
         print("\nOptions:")
         print("  -g/-t, --gallery            start in gallery mode")
         print("  -T N,  --gallery-tile-size  gallery tile size in pixels")
@@ -2962,6 +3290,8 @@ def run_selector():
         print("F2                     toggle search bar / direct-key mode")
         print("\nDirect-key mode (--no-searchbar or F2): the search bar is")
         print("hidden and every Ctrl+<key> action is rebound to plain <key>.")
+        print("\nConfig file: ~/.config/tkiv.py/config  "
+              "(or $XDG_CONFIG_HOME/tkiv.py/config)")
         return 0
 
     if args.version:
