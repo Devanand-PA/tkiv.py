@@ -40,6 +40,14 @@ use Ctrl+):
     Ctrl+{ / Ctrl+}  gamma down/up
     Ctrl+Y        cycle sort (name / date / size)
     Ctrl+Shift+Y  reverse sort direction
+
+    F2           toggle search bar / direct-key mode (no Ctrl needed)
+
+Direct-key mode (--no-searchbar / F2):
+    Hides the search bar and rebinds every Ctrl+<key> action to the plain
+    <key> (and Shift+Ctrl+<key> to Shift+<key>).  Navigation keys
+    (arrows, Tab, Return, Esc, Delete, PageUp/Down, Home/End) behave the
+    same as always.  F2 switches back.
 """
 
 # ============================================================ imports
@@ -97,7 +105,7 @@ THEME = {
 
 
 # ============================================================ constants
-VERSION  = "0.3.0"
+VERSION  = "0.4.0"
 PROGNAME = "tkiv"
 
 SCALE_DOWN   = 'd'
@@ -126,10 +134,10 @@ DEGREE_90, DEGREE_180, DEGREE_270     = 1, 2, 3
 FLIP_HORIZONTAL, FLIP_VERTICAL        = 1, 2
 
 # Sorting
-SORT_NONE  = 'none'    # discovery order
-SORT_NAME  = 'name'    # natural (reverse=False) = A->Z
-SORT_MTIME = 'mtime'   # natural (reverse=False) = newest first
-SORT_SIZE  = 'size'    # natural (reverse=False) = largest first
+SORT_NONE  = 'none'
+SORT_NAME  = 'name'
+SORT_MTIME = 'mtime'
+SORT_SIZE  = 'size'
 
 IMAGE_EXTS = {
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
@@ -145,12 +153,10 @@ THUMB_WORKERS       = 4
 PREFETCH_MAX        = 3
 THUMB_MAX_IN_FLIGHT = 12
 QUEUE_POLL_MS       = 20
+FILTER_DEBOUNCE_MS  = 60
 
-# Lazy-scan tuning.  The scanner thread accumulates paths and posts them
-# to the main thread in batches of this size, so that the per-batch commit
-# cost (append + visible-index extend) is O(1) amortised per file instead
-# of O(N).  Redraws are coalesced separately via after_idle.
-LAZY_BATCH_SIZE     = 128
+# Lazy-scan tuning.
+LAZY_BATCH_SIZE      = 128
 LISTBOX_INSERT_CHUNK = 1000
 
 GALLERY_TILE_MIN   = 96
@@ -164,7 +170,6 @@ GALLERY_SIZE_QUANTUM  = 8
 GALLERY_OVERSCAN_ROWS = 2
 GALLERY_ZOOM_STEP     = 32
 
-# Aspect-ratio-aware tiles (mirrors sel_img.py behaviour)
 GALLERY_ASPECT_DEFAULT = 16.0 / 9.0
 GALLERY_ASPECT_MIN     = 0.4
 GALLERY_ASPECT_MAX     = 3.0
@@ -311,7 +316,10 @@ def _pil_load_frames(path):
         except Exception:
             frames, delays = [], []
     if not frames:
-        im = Image.open(path)
+        try:
+            im.seek(0)
+        except Exception:
+            im = Image.open(path)
         if im.mode not in ('RGB', 'RGBA', 'L', 'LA'):
             im = im.convert('RGBA')
         frames, delays = [im], [DEF_ANIM_DELAY]
@@ -343,6 +351,13 @@ def load_gallery_thumb(path, max_w, max_h):
 
 
 def _get_orig_size(path):
+    """Return (width, height) without decoding pixels."""
+    if HAVE_VIPS:
+        try:
+            v = pyvips.Image.new_from_file(path, access='sequential')
+            return (v.width, v.height)
+        except Exception:
+            pass
     try:
         with Image.open(path) as img:
             return img.size
@@ -362,7 +377,6 @@ def _disk_cache_path(path, w, h):
 
 
 def _decode_thumb(path, max_w, max_h):
-    """Decode with disk cache (selector path)."""
     orig_size = _get_orig_size(path)
     cache_file = _disk_cache_path(path, max_w, max_h) if DISK_CACHE_ENABLED else None
 
@@ -378,7 +392,7 @@ def _decode_thumb(path, max_w, max_h):
                 pass
 
     pil_img = None
-    if HAS_VIPS and HAS_NUMPY:
+    if HAVE_VIPS and HAVE_NUMPY:
         try:
             v = pyvips.Image.thumbnail(path, max_w, height=max_h, size="down")
             arr = v.numpy()
@@ -429,7 +443,6 @@ def _decode_thumb(path, max_w, max_h):
 
 # ============================================================ CLI
 def _add_shared_ui_options(p, mode):
-    """Options shared by both viewer and selector."""
     p.add_argument('-g', '-t', '--gallery', '--thumbnail',
                    action='store_true', dest='thumb_mode',
                    help='start in gallery mode')
@@ -468,6 +481,10 @@ def _add_shared_ui_options(p, mode):
                    help='newline-separated labels to pre-select at launch')
     p.add_argument('--pre-select-file', default=None,
                    help='file containing pre-select labels')
+    p.add_argument('--no-searchbar', '--no-search', '--direct-keys',
+                   action='store_true', dest='no_searchbar',
+                   help='hide the search bar and use plain key bindings '
+                        'without the Ctrl modifier (toggle at runtime with F2)')
     p.add_argument('-q', '--quiet', action='store_true')
     p.add_argument('-v', '--version', action='store_true')
     p.add_argument('-h', '--help', action='store_true')
@@ -479,13 +496,13 @@ def build_viewer_parser():
         usage='%(prog)s [-abcgHhiopqrvZ0] [-A FRAMERATE] [-e WID] [-G GAMMA] '
               '[--geometry GEOMETRY] [-N NAME] [-n NUM] [-S DELAY] [-s MODE] '
               '[-T SIZE] [--gallery-rows N] [--gallery-cols N] '
-              '[--gallery-aspect N] [--sort MODE] [-R] FILES...')
+              '[--gallery-aspect N] [--sort MODE] [-R] [--no-searchbar] FILES...')
     p.add_argument('-a', '--animate', action='store_true')
     p.add_argument('-A', '--framerate', type=int, default=0)
     p.add_argument('--assume-files', action='store_true')
     p.add_argument('-b', '--no-bar', action='store_true')
     p.add_argument('--bar', action='store_true')
-    p.add_argument('--floating-window', dest='floating_window',action='store_true')
+    p.add_argument('--floating-window', dest='floating_window', action='store_true')
     p.add_argument('-c', '--clean-cache', action='store_true')
     p.add_argument('-e', '--embed', type=int, default=0)
     p.add_argument('-f', '--fullscreen', action='store_true')
@@ -547,23 +564,27 @@ def _read_pre_select(args):
 # ============================================================ file entry
 class FileEntry:
     __slots__ = ('name', 'path', 'flags', 'label')
-    def __init__(self, name, label=None):
-        self.name = name
-        self.path = name
+    def __init__(self, path, label=None):
+        self.name = path
+        self.path = path
         self.flags = 0
-        self.label = label if label is not None else os.path.basename(name)
+        self.label = label if label is not None else os.path.basename(path)
 
 
 # ============================================================ unified app
 class TkivApp:
-    """Unified viewer/selector app. `purpose` selects Enter behavior
-    and output-on-exit semantics."""
+    """Unified viewer/selector app."""
 
-    def __init__(self, root, opts, files, purpose='view',enable_floating_window=False):
+    def __init__(self, root, opts, files, purpose='view',
+                 enable_floating_window=False):
         self.purpose = purpose
         self.enable_floating_window = enable_floating_window
         self.root = root
         self.opts = opts
+        self.no_searchbar = bool(getattr(opts, 'no_searchbar', False))
+        self._bound_target = None
+        self._bound_seqs = []
+
         self.files = list(files)
         if not self.files and not getattr(opts, 'lazy', False):
             raise SystemExit("no files")
@@ -580,19 +601,10 @@ class TkivApp:
         self._quitting = False
         self._scan_cancel = False
 
-        # ----- lazy-scan state ---------------------------------------------
-        # The scanner thread accumulates paths into batches and posts them
-        # to the main queue.  The main thread buffers them in
-        # `_lazy_pending` and commits the whole buffer in one O(1)-per-file
-        # step (append + extend) via `_commit_lazy_batch`.  Redraws are
-        # coalesced through `_lazy_needs_redraw` / `after_idle`.  This
-        # avoids the O(N^2) cost of redrawing / re-filtering / repopulating
-        # the listbox once per discovered file.
+        # ----- lazy-scan state
         self._lazy_pending        = []
         self._lazy_commit_pending = False
         self._lazy_needs_redraw   = False
-        # Desired 1-based start index, applied after the first lazy batch
-        # commits (the list was empty when __init__ ran).
         self._desired_start = max(0, getattr(opts, 'start_at', 1) - 1)
 
         # Filtering
@@ -668,7 +680,9 @@ class TkivApp:
         self._gallery_aspect_opt = (float(ga)
                                     if ga is not None and ga > 0 else None)
         self._gallery_aspect_cache = None
-        self._orig_sizes = {}   # path -> (w, h), for aspect auto-detection
+        self._aspect_pending = False
+        self._aspect_gen = 0
+        self._orig_sizes = {}
 
         self._tile_w = 240
         self._tile_h = 240
@@ -678,8 +692,6 @@ class TkivApp:
         self._pending_gallery_scroll = None
         self._gallery_redraw_pending = False
 
-        # Cached caption font metrics (monospace, so character count maps
-        # directly to pixel width).
         self._caption_char_w = 1
         self._caption_line_h = 1
 
@@ -687,7 +699,7 @@ class TkivApp:
         self._list_photo = None
         self._list_pending = -1
 
-        # Pre-select (labels)
+        # Pre-select
         pre_labels = _read_pre_select(opts) if hasattr(opts, 'pre_select') else None
         if pre_labels:
             self._apply_pre_select(pre_labels)
@@ -731,9 +743,6 @@ class TkivApp:
         self.root.title(self.opts.name or 'tkiv')
         self.root.configure(bg=self.bg)
 
-        # Selector windows use the same floating/centred setup as sel_img:
-        # make the window a dialog, keep it above other windows, and give it
-        # a 50px margin on every side of the screen.
         if (self.purpose == 'select') or self.enable_floating_window:
             self.root.attributes('-topmost', True)
             try:
@@ -750,8 +759,6 @@ class TkivApp:
         self.bar_font = tkfont.Font(family='monospace', size=10)
         self.bar_height = self.bar_font.metrics('linespace') + 4
 
-        # Cache caption font metrics for the ellipsis/wrap logic.  The
-        # caption font is monospace, so character count maps to pixel width.
         self._caption_char_w = max(1, self.bar_font.measure('M'))
         self._caption_line_h = max(1, self.bar_font.metrics('linespace'))
 
@@ -759,7 +766,6 @@ class TkivApp:
                          or getattr(self.opts, 'bar', False))
 
         self.content = tk.Frame(self.root, bg=self.bg)
-        self.content.pack(side=TOP, fill=BOTH, expand=True)
 
         # image canvas
         self.canvas = tk.Canvas(self.content, bg=self.bg,
@@ -819,8 +825,6 @@ class TkivApp:
         self.status = tk.Label(self.root, text='', anchor='w',
                                bg=self.bg, fg=self.fg,
                                font=self.bar_font, padx=8, pady=2)
-        if self.show_bar:
-            self.status.pack(side=BOTTOM, fill=X)
 
         self.search_var = StringVar()
         self.search_var.trace_add('write', self._on_search_change)
@@ -832,8 +836,9 @@ class TkivApp:
             highlightbackground=THEME['bg_secondary'],
             highlightcolor=THEME['accent'],
             relief='flat', font=('sans-serif', 12))
-        self.search_entry.pack(side=BOTTOM, fill=X, padx=4, pady=(2, 4))
+        self._search_pack_opts = dict(side=BOTTOM, fill=X, padx=4, pady=(2, 4))
 
+        self._relayout_bars()
         self._show_content()
 
         self.root.update_idletasks()
@@ -841,6 +846,18 @@ class TkivApp:
         self.win_h = max(1, self.content.winfo_height())
 
         self.tk_img = None
+
+    def _relayout_bars(self):
+        """(Re)pack the content frame, status bar, and search bar."""
+        self.content.pack_forget()
+        self.status.pack_forget()
+        self.search_entry.pack_forget()
+
+        self.content.pack(side=TOP, fill=BOTH, expand=True)
+        if self.show_bar:
+            self.status.pack(side=BOTTOM, fill=X)
+        if not self.no_searchbar:
+            self.search_entry.pack(**self._search_pack_opts)
 
     def _show_content(self):
         self.canvas.pack_forget()
@@ -865,23 +882,70 @@ class TkivApp:
         return handler
 
     def _setup_bindings(self):
-        e = self.search_entry
-        e.bind('<Up>',    self._mk_break(lambda: self._key_nav(DIR_UP)))
-        e.bind('<Down>',  self._mk_break(lambda: self._key_nav(DIR_DOWN)))
-        e.bind('<Left>',  self._mk_break(lambda: self._key_nav(DIR_LEFT)))
-        e.bind('<Right>', self._mk_break(lambda: self._key_nav(DIR_RIGHT)))
-        e.bind('<Prior>', self._mk_break(lambda: self._key_page(-1)))
-        e.bind('<Next>',  self._mk_break(lambda: self._key_page(1)))
-        e.bind('<Home>',  self._mk_break(self.act_first))
-        e.bind('<End>',   self._mk_break(self.act_last))
+        self._setup_static_bindings()
+        self._setup_key_bindings()
 
-        e.bind('<Tab>',          self._mk_break(lambda: self._cycle_mode(1)))
-        e.bind('<Shift-Tab>',    self._mk_break(lambda: self._cycle_mode(-1)))
-        e.bind('<ISO_Left_Tab>', self._mk_break(lambda: self._cycle_mode(-1)))
-        e.bind('<Return>',       self._mk_break(self._key_return))
-        e.bind('<KP_Enter>',     self._mk_break(self._key_return))
-        e.bind('<Escape>',       self._mk_break(self._key_escape))
-        e.bind('<Delete>',       self._mk_break(self._key_delete))
+    def _setup_static_bindings(self):
+        for b in (1, 2, 3, 4, 5):
+            self.canvas.bind(f'<ButtonPress-{b}>',
+                             lambda ev, btn=b: self.on_button(ev, btn))
+            self.gallery_canvas.bind(f'<ButtonPress-{b}>',
+                                     lambda ev, btn=b: self.on_button(ev, btn))
+
+        self.canvas.bind('<Configure>', self.on_configure)
+        self.gallery_canvas.bind('<Configure>', self.on_configure, add='+')
+        self.root.protocol('WM_DELETE_WINDOW',
+                           lambda: self.quit(1 if self.purpose == 'select' else 0))
+
+    def _setup_key_bindings(self):
+        for seq in self._bound_seqs:
+            for tgt in (self.root, self.search_entry):
+                try:
+                    tgt.unbind(seq)
+                except Exception:
+                    pass
+        self._bound_seqs = []
+        try:
+            self.root.unbind('<KeyPress>')
+        except Exception:
+            pass
+
+        if self.no_searchbar:
+            target = self.root
+            ctrl   = ''
+        else:
+            target = self.search_entry
+            ctrl   = 'Control-'
+        self._bound_target = target
+
+        def _b(seq, fn):
+            try:
+                target.bind(seq, self._mk_break(fn))
+                self._bound_seqs.append(seq)
+            except tk.TclError:
+                pass
+
+        # navigation
+        _b('<Up>',    lambda: self._key_nav(DIR_UP))
+        _b('<Down>',  lambda: self._key_nav(DIR_DOWN))
+        _b('<Left>',  lambda: self._key_nav(DIR_LEFT))
+        _b('<Right>', lambda: self._key_nav(DIR_RIGHT))
+        _b('<Prior>', lambda: self._key_page(-1))
+        _b('<Next>',  lambda: self._key_page(1))
+        _b('<Home>',  self.act_first)
+        _b('<End>',   self.act_last)
+
+        # mode / accept / cancel
+        _b('<Tab>',          lambda: self._cycle_mode(1))
+        _b('<Shift-Tab>',    lambda: self._cycle_mode(-1))
+        _b('<ISO_Left_Tab>', lambda: self._cycle_mode(-1))
+        _b('<Return>',       self._key_return)
+        _b('<KP_Enter>',     self._key_return)
+        _b('<Escape>',       self._key_escape)
+        _b('<Delete>',       self._key_delete)
+
+        # F2 toggles searchbar/direct-key mode
+        _b('<F2>', self.act_toggle_searchbar)
 
         ctrl_bindings = {
             'q':            self.quit,
@@ -924,33 +988,34 @@ class TkivApp:
             'underscore':   lambda: self.act_flip(FLIP_VERTICAL),
         }
         for key, fn in ctrl_bindings.items():
-            e.bind(f'<Control-{key}>', self._mk_break(fn))
+            _b(f'<{ctrl}{key}>', fn)
 
-        # Ctrl+Enter = toggle mark (used especially in selector)
-        e.bind('<Control-Return>', self._mk_break(self.act_toggle_mark))
+        if not self.no_searchbar:
+            _b('<Control-Return>', self.act_toggle_mark)
 
-        # Shift+Ctrl variants
-        e.bind('<Control-Shift-W>', self._mk_break(lambda: self.act_fit(SCALE_FIT)))
-        e.bind('<Control-Shift-F>', self._mk_break(lambda: self.act_fit(SCALE_FILL)))
-        e.bind('<Control-Shift-E>', self._mk_break(lambda: self.act_fit(SCALE_HEIGHT)))
-        e.bind('<Control-Shift-I>', self._mk_break(self.act_toggle_alpha))
-        e.bind('<Control-Shift-Y>', self._mk_break(self.act_sort_reverse))
+        if self.no_searchbar:
+            _b('<W>', lambda: self.act_fit(SCALE_FIT))
+            _b('<F>', lambda: self.act_fit(SCALE_FILL))
+            _b('<E>', lambda: self.act_fit(SCALE_HEIGHT))
+            _b('<I>', self.act_toggle_alpha)
+            _b('<Y>', self.act_sort_reverse)
+        else:
+            _b('<Control-Shift-W>', lambda: self.act_fit(SCALE_FIT))
+            _b('<Control-Shift-F>', lambda: self.act_fit(SCALE_FILL))
+            _b('<Control-Shift-E>', lambda: self.act_fit(SCALE_HEIGHT))
+            _b('<Control-Shift-I>', self.act_toggle_alpha)
+            _b('<Control-Shift-Y>', self.act_sort_reverse)
 
-        for b in (1, 2, 3, 4, 5):
-            self.canvas.bind(f'<ButtonPress-{b}>',
-                             lambda ev, btn=b: self.on_button(ev, btn))
-            self.gallery_canvas.bind(f'<ButtonPress-{b}>',
-                                     lambda ev, btn=b: self.on_button(ev, btn))
-
-        self.canvas.bind('<Configure>', self.on_configure)
-        self.gallery_canvas.bind('<Configure>', self.on_configure, add='+')
-        self.root.protocol('WM_DELETE_WINDOW',
-                           lambda: self.quit(1 if self.purpose == 'select' else 0))
-
-        self.root.bind('<KeyPress>', self._on_root_key)
-        self.search_entry.focus_set()
+        if not self.no_searchbar:
+            try:
+                self.root.bind('<KeyPress>', self._on_root_key)
+            except tk.TclError:
+                pass
+            self.search_entry.focus_set()
 
     def _on_root_key(self, event):
+        if self.no_searchbar:
+            return
         if self.root.focus_get() is self.search_entry:
             return
         self.search_entry.focus_set()
@@ -958,11 +1023,36 @@ class TkivApp:
             self.search_entry.insert(END, event.char)
             self.search_entry.icursor(END)
 
+    # ---------------------------------------------------------- searchbar toggle
+    def act_toggle_searchbar(self):
+        self.no_searchbar = not self.no_searchbar
+        if self.no_searchbar:
+            self.reset_timeout('filter')
+            self._filter_text = ""
+            self.search_var.set("")
+            self._rebuild_visible()
+        self._relayout_bars()
+        self._setup_key_bindings()
+        if not self.no_searchbar:
+            try:
+                self.search_entry.focus_set()
+            except tk.TclError:
+                pass
+        self.root.after(50, self._refresh_size)
+        self.update_info()
+
     # ---------------------------------------------------------- filtering
     def _on_search_change(self, *args):
+        if self.no_searchbar:
+            return
         self._filter_text = self.search_var.get()
         self._rebuild_visible()
+        self.set_timeout('filter', FILTER_DEBOUNCE_MS,
+                         self._apply_filter_ui, overwrite=True)
 
+    def _apply_filter_ui(self):
+        if self._quitting:
+            return
         if self._visible_indices and self.fileidx not in self._visible_indices:
             self.fileidx = self._visible_indices[0]
             self._persist_index()
@@ -982,15 +1072,18 @@ class TkivApp:
             self.update_info()
 
     def _rebuild_visible(self):
-        query = self._filter_text.lower().strip()
-        if not query:
+        if self.no_searchbar:
             self._visible_indices = list(range(len(self.files)))
             return
-        terms = query.split()
-        self._visible_indices = [
-            i for i, f in enumerate(self.files)
-            if all(t in f.label.lower() or t in f.path.lower() for t in terms)
-        ]
+        query = self._filter_text.lower().strip()
+        terms = query.split() if query else []
+        if not terms:
+            self._visible_indices = list(range(len(self.files)))
+        else:
+            self._visible_indices = [
+                i for i, f in enumerate(self.files)
+                if all(t in f.label.lower() or t in f.path.lower() for t in terms)
+            ]
 
     def _initial_load(self):
         if not self.files:
@@ -1005,21 +1098,6 @@ class TkivApp:
             self.redraw()
 
     # ---------------------------------------------------------- lazy scan
-    #
-    # Design notes
-    # ------------
-    # The scanner thread does the filesystem work and groups discovered
-    # paths into batches of LAZY_BATCH_SIZE.  Each batch is posted to the
-    # main queue via a single lambda.  On the main thread `_queue_lazy_files`
-    # buffers the batch into `_lazy_pending` and schedules a single
-    # `_commit_lazy_batch` via after_idle.  The commit itself performs only
-    # O(len(batch)) work (extend `files` / `tns_thumbs` / `_visible_indices`)
-    # and then schedules a single coalesced redraw.
-    #
-    # Net result: total scan cost is O(N) for the model updates plus
-    # O(1) redraws per queue drain, instead of O(N^2) from redrawing,
-    # re-filtering, and repopulating the listbox once per file.
-    #
     def start_lazy_scan(self, paths, recursive=False, sort_time=False):
         def worker():
             seen = set()
@@ -1086,8 +1164,6 @@ class TkivApp:
                          name='tkiv-scan').start()
 
     def _queue_lazy_files(self, paths):
-        """Main-thread handler for a scanned batch.  Buffers paths and
-        schedules a single commit via after_idle."""
         if self._quitting:
             return
         self._lazy_pending.extend(paths)
@@ -1096,14 +1172,6 @@ class TkivApp:
             self.root.after_idle(self._commit_lazy_batch)
 
     def _commit_lazy_batch(self):
-        """Append every buffered lazy path in one shot.
-
-        This is the O(1)-per-file hot path: we extend the parallel lists
-        and (when there is no active filter) extend `_visible_indices`
-        rather than rebuilding it.  Note that `_files_gen` is *not*
-        bumped here — appending does not shift existing indices, so
-        outstanding prefetch / thumbnail decodes remain valid.
-        """
         self._lazy_commit_pending = False
         if self._quitting:
             return
@@ -1119,23 +1187,24 @@ class TkivApp:
         self.files.extend(new_entries)
         self.tns_thumbs.extend([None] * len(new_entries))
 
-        if not self._filter_text:
-            # Fast path: no filter active, visible indices are contiguous.
+        if not self._filter_text and not self.no_searchbar:
             self._visible_indices.extend(range(n_before, len(self.files)))
         else:
             self._rebuild_visible()
 
-        # While we are still gathering the aspect-ratio sample, drop the
-        # cached value so the auto-detection sees the new files.  Once we
-        # have at least GALLERY_ASPECT_SAMPLE files the cache is stable.
+        # Invalidate the aspect cache while we are still gathering the
+        # sample images.  Also bump the aspect generation and clear the
+        # pending flag so an in-flight worker is discarded and a fresh
+        # one can be started.
         if self._gallery_aspect_opt is None:
             n_after = len(self.files)
             if (n_after <= GALLERY_ASPECT_SAMPLE
                     or n_before < GALLERY_ASPECT_SAMPLE <= n_after):
                 self._gallery_aspect_cache = None
+                self._aspect_gen += 1
+                self._aspect_pending = False
 
         if first:
-            # First batch — honour --start-at now that we have a list.
             self.fileidx = min(self._desired_start, len(self.files) - 1)
             self._persist_index()
             if self.mode == MODE_IMAGE:
@@ -1146,21 +1215,12 @@ class TkivApp:
         self._schedule_lazy_redraw()
 
     def _schedule_lazy_redraw(self):
-        """Coalesce many batch commits into a single redraw."""
         if self._lazy_needs_redraw:
             return
         self._lazy_needs_redraw = True
         self.root.after_idle(self._do_lazy_redraw)
 
     def _do_lazy_redraw(self):
-        """Incremental redraw used while a lazy scan is in progress.
-
-        For gallery mode the existing overscan-based renderer already
-        only touches visible tiles, so calling render_gallery() is cheap.
-        For list mode we deliberately skip the preview image (which
-        would decode a file on every redraw) and only keep the listbox
-        in sync; the full render_list() runs once the scan finishes.
-        """
         self._lazy_needs_redraw = False
         if self._quitting:
             return
@@ -1174,15 +1234,10 @@ class TkivApp:
             self.update_info()
 
     def _lazy_scan_finished(self):
-        """Called once the scanner thread has posted its last batch."""
-        # Flush anything still buffered (this also cancels the pending
-        # after_idle commit — the flag is cleared at the top of the method).
         self._commit_lazy_batch()
         if self._quitting:
             return
 
-        # Sorting needs the complete list to be meaningful, so we defer
-        # it to the end of the scan.  _apply_sort() redraws on its own.
         if self._sort_mode != SORT_NONE:
             self._apply_sort()
             return
@@ -1266,12 +1321,6 @@ class TkivApp:
         return None
 
     def _apply_sort(self, mode=None, reverse=None, refresh=True):
-        """Reorder self.files (and self.tns_thumbs) in place.
-
-        Preserves the current file by path.  `refresh=False` skips the
-        post-sort reload/redraw (used at startup before the first image
-        load).
-        """
         if mode is not None:
             self._sort_mode = mode
         if reverse is not None:
@@ -1288,9 +1337,6 @@ class TkivApp:
         if 0 <= self.fileidx < len(self.files):
             cur_path = self.files[self.fileidx].path
 
-        # For MTIME/SIZE the natural presentation is "biggest / newest
-        # first", i.e. a descending sort.  sorted() ascends by default,
-        # so flip the flag.
         rev = self._sort_reverse
         if self._sort_mode in (SORT_MTIME, SORT_SIZE):
             rev = not rev
@@ -1303,7 +1349,6 @@ class TkivApp:
         self.files      = [p[0] for p in paired]
         self.tns_thumbs = [p[1] for p in paired]
 
-        # Restore the current file by path.
         if cur_path is not None:
             for i, f in enumerate(self.files):
                 if f.path == cur_path:
@@ -1316,13 +1361,17 @@ class TkivApp:
         self.markidx   = self.fileidx
         self.alternate = self.fileidx
 
-        # Every index-keyed cache is now stale.
         self._files_gen += 1
         self._load_token += 1
         self._prefetch_cache.clear()
         self._img_in_flight.clear()
         self._gallery_in_flight.clear()
         self._mtimes.clear()
+        # Aspect cache depends on the first GALLERY_ASPECT_SAMPLE files,
+        # which just changed.  Invalidate it.
+        self._gallery_aspect_cache = None
+        self._aspect_gen += 1
+        self._aspect_pending = False
 
         self._rebuild_visible()
         self._persist_index()
@@ -1338,7 +1387,6 @@ class TkivApp:
             self.redraw()
 
     def _sort_label(self):
-        """Short 'name^' / 'datev' / 'sizev' label for the status bar."""
         if self._sort_mode == SORT_NONE:
             return ''
         name = {SORT_NAME: 'name',
@@ -1354,8 +1402,6 @@ class TkivApp:
         return name + arrow
 
     def act_sort_cycle(self):
-        """Ctrl+Y: cycle name-up -> name-down -> date-down -> date-up ->
-        size-down -> size-up -> ..."""
         cycle = [
             (SORT_NAME,  False),
             (SORT_NAME,  True),
@@ -1373,7 +1419,6 @@ class TkivApp:
         self._apply_sort(mode, rev)
 
     def act_sort_reverse(self):
-        """Ctrl+Shift+Y: flip the current sort direction (or start name sort)."""
         if self._sort_mode == SORT_NONE:
             self._apply_sort(SORT_NAME, False)
         else:
@@ -1420,11 +1465,6 @@ class TkivApp:
         self.fileidx = n
 
     def _persist_index(self):
-        """Write the current index to idx_write_path, if configured.
-
-        The value is 1-based, matching --start-at and the status bar.
-        Idempotent; failures are swallowed (debug interface).
-        """
         path = getattr(self.opts, 'idx_write_path', None)
         if not path:
             return
@@ -1465,7 +1505,7 @@ class TkivApp:
                 frames, delays = load_frames(path, max_dim=MAX_LOAD_DIM)
             except Exception as e:
                 if not getattr(self.opts, 'quiet', False):
-                    sys.stderr.write(f"{PROGNAME}: {self.files[n].name}: {e}\n")
+                    sys.stderr.write(f"{PROGNAME}: {path}: {e}\n")
                 if getattr(self.opts, 'assume_files', False):
                     self.img_frames = []
                     self.img_w = self.img_h = 0
@@ -1609,10 +1649,8 @@ class TkivApp:
     def _steps_to_range(d, mx, offset):
         return offset + d * ((1.0 if d <= 0 else (mx - 1.0)) / CC_STEPS)
 
-    def _effective_image(self):
-        if not self.img_frames:
-            return None
-        im = self.img_frames[self.img_sel]
+    def _prepare_crop(self, im):
+        """Flatten RGBA and apply colour adjustments to a cropped region."""
         if im.mode == 'RGBA':
             bg = Image.new('RGB', im.size, self.bg)
             bg.paste(im, (0, 0), im)
@@ -1677,10 +1715,8 @@ class TkivApp:
         self._fit()
         self._check_pan()
 
-        im = self._effective_image()
-        if im is None:
-            return
-        iw, ih = im.size
+        frame = self.img_frames[self.img_sel]
+        iw, ih = frame.size
         if iw == 0 or ih == 0:
             return
 
@@ -1701,7 +1737,9 @@ class TkivApp:
         if ix1 <= ix0: ix1 = ix0 + 1
         if iy1 <= iy0: iy1 = iy0 + 1
 
-        cropped = im.crop((ix0, iy0, ix1, iy1))
+        cropped = frame.crop((ix0, iy0, ix1, iy1))
+        cropped = self._prepare_crop(cropped)
+
         dw = max(1, int((ix1 - ix0) * z + 0.5))
         dh = max(1, int((iy1 - iy0) * z + 0.5))
 
@@ -1720,53 +1758,74 @@ class TkivApp:
 
     # ---------------------------------------------------------- aspect detection
     def _get_gallery_aspect(self):
-        """Return the tile aspect ratio (width / height).
+        """Return tile aspect ratio (width / height).
 
-        When `--gallery-aspect` was supplied, use it directly.  Otherwise
-        sample the first GALLERY_ASPECT_SAMPLE files and take the median
+        Uses --gallery-aspect if supplied.  Otherwise samples the first
+        GALLERY_ASPECT_SAMPLE files off the UI thread and takes the median
         aspect ratio, clamped to [GALLERY_ASPECT_MIN, GALLERY_ASPECT_MAX].
-        Mirrors sel_img.py's behaviour.
+        A provisional default is returned until the worker finishes.
         """
         if self._gallery_aspect_cache is not None:
             return self._gallery_aspect_cache
 
-        a = None
         if self._gallery_aspect_opt is not None:
-            a = float(self._gallery_aspect_opt)
-        else:
-            ratios = []
-            for f in self.files[:GALLERY_ASPECT_SAMPLE]:
-                sz = self._orig_sizes.get(f.path)
-                if sz is None:
-                    sz = _get_orig_size(f.path)
-                    self._orig_sizes[f.path] = sz
-                w, h = sz
-                if w > 0 and h > 0:
-                    ratios.append(w / h)
-            if ratios:
-                ratios.sort()
-                a = ratios[len(ratios) // 2]
+            a = max(GALLERY_ASPECT_MIN,
+                    min(GALLERY_ASPECT_MAX, float(self._gallery_aspect_opt)))
+            self._gallery_aspect_cache = a
+            return a
 
-        if a is None or a <= 0:
-            a = GALLERY_ASPECT_DEFAULT
+        if not self._aspect_pending:
+            self._aspect_pending = True
+            self._aspect_gen += 1
+            gen = self._aspect_gen
+            sample = list(self.files[:GALLERY_ASPECT_SAMPLE])
 
+            def worker():
+                ratios = []
+                for f in sample:
+                    sz = self._orig_sizes.get(f.path)
+                    if sz is None:
+                        sz = _get_orig_size(f.path)
+                        self._orig_sizes[f.path] = sz
+                    w, h = sz
+                    if w > 0 and h > 0:
+                        ratios.append(w / h)
+                self._post(lambda: self._finish_aspect(ratios, gen))
+
+            threading.Thread(target=worker, daemon=True,
+                             name='tkiv-aspect').start()
+
+        self._gallery_aspect_cache = GALLERY_ASPECT_DEFAULT
+        return self._gallery_aspect_cache
+
+    def _finish_aspect(self, ratios, gen):
+        if gen != self._aspect_gen:
+            return
+        self._aspect_pending = False
+        if self._quitting or not ratios:
+            return
+        ratios.sort()
+        a = ratios[len(ratios) // 2]
         a = max(GALLERY_ASPECT_MIN, min(GALLERY_ASPECT_MAX, a))
+        if a == self._gallery_aspect_cache:
+            return
         self._gallery_aspect_cache = a
-        return a
+        # Provisional tiles used a different aspect ratio; invalidate
+        # every thumbnail so they are decoded at the new size.
+        self._files_gen += 1
+        self.tns_thumbs = [None] * len(self.files)
+        self._gallery_in_flight.clear()
+        if self.mode == MODE_GALLERY:
+            self._pending_gallery_scroll = self.fileidx
+            self.redraw()
 
     # ---------------------------------------------------------- gallery rendering
     def _compute_tile_metrics(self):
-        """Return (tile_w, tile_h, caption_h, pad).
-
-        Tiles are no longer forced to be square: their aspect ratio is
-        derived from the gallery aspect (auto-detected or --gallery-aspect).
-        """
         cw = max(self.win_w, 1)
         ch = max(self.win_h, 1)
         aspect = self._get_gallery_aspect()
 
         if self._gallery_tile_override is not None:
-            # `--gallery-tile-size` / Ctrl+zoom specifies the long side.
             long_side = float(self._gallery_tile_override)
             if aspect >= 1.0:
                 base_w = long_side
@@ -1825,28 +1884,18 @@ class TkivApp:
         return max(1, (self.win_w - pad) // (self._tile_w + pad))
 
     def _fit_caption(self, label, max_w, max_h):
-        """Return a (possibly multi-line) caption string that fits within
-        (max_w, max_h) pixels using the monospace caption font.
-
-        Tk's Canvas.create_text does not clip text, so we pre-wrap and
-        truncate here: over-long words are hard-broken, and if the label
-        cannot fit in the available lines, the last line is ended with an
-        ellipsis.  Because the caption font is monospace, character count
-        maps directly to pixel width.
-        """
         char_w = self._caption_char_w
         line_h = self._caption_line_h
         if char_w <= 0 or line_h <= 0 or max_w <= 1 or max_h <= 1:
             return label
 
-        cpl = max(1, int(max_w // char_w))        # chars per line
-        max_lines = max(1, int(max_h // line_h))  # lines we can draw
+        cpl = max(1, int(max_w // char_w))
+        max_lines = max(1, int(max_h // line_h))
         ell = '…'
 
         if len(label) <= cpl:
             return label
 
-        # Tokenise: split on whitespace, then hard-break over-long words.
         tokens = []
         for w in label.split():
             while len(w) > cpl:
@@ -1878,13 +1927,11 @@ class TkivApp:
             if cur and len(lines) < max_lines:
                 lines.append(cur)
             elif cur:
-                # No room for `cur` — need to truncate.
                 truncated = True
 
         if not truncated and consumed >= len(tokens):
             return '\n'.join(lines)
 
-        # Truncate the last retained line with an ellipsis.
         if lines:
             last = lines[-1]
             if len(last) >= cpl:
@@ -1940,8 +1987,6 @@ class TkivApp:
             self._schedule_gallery_redraw()
 
     def _schedule_gallery_redraw(self):
-        """Coalesce many thumbnail-ready events into one redraw.
-        Runs as an idle task, so Tk processes buffered key events first."""
         if self._gallery_redraw_pending:
             return
         self._gallery_redraw_pending = True
@@ -2063,7 +2108,6 @@ class TkivApp:
                     x + self._tile_w - 2,  y + self._tile_h - 2,
                     fill=self.mark_fg, outline=self.mark_fg)
 
-            # Caption: pre-truncate/wrap so it never overflows the tile.
             caption = self._fit_caption(
                 self.files[abs_i].label,
                 max(20, self._tile_w - 4),
@@ -2132,15 +2176,9 @@ class TkivApp:
 
     # ---------------------------------------------------------- list rendering
     def _populate_listbox(self):
-        """Rebuild the listbox contents.
-
-        Two optimisations over the naive version:
-          * labels are inserted in chunks rather than one-by-one, and
-          * only marked items get per-item colour overrides, so the
-            common case (nothing marked) skips the itemconfig loop
-            entirely.  The Listbox defaults already match the unmarked
-            style.
-        """
+        """Rebuild the listbox contents in chunks.  Only marked items get
+        per-item colour overrides so the common case skips the itemconfig
+        loop entirely."""
         self.listbox.delete(0, END)
         n = len(self._visible_indices)
         if n == 0:
@@ -2281,34 +2319,16 @@ class TkivApp:
         self.status.config(text=text)
 
     # ---------------------------------------------------------- quit / output
-    def _collect_selection(self):
+    def _emit_output(self, use_labels):
+        """Print marked files (or the current file) to stdout."""
         marked = [f for f in self.files if f.flags & FF_MARK]
         if not marked and 0 <= self.fileidx < len(self.files):
             marked = [self.files[self.fileidx]]
-        return marked
-
-    def _emit_selector_output(self):
-        marked = self._collect_selection()
         if not marked:
             return
-        return_label = getattr(self.opts, 'return_label', False)
-        out = []
-        for f in marked:
-            out.append(f.label if return_label else f.path)
         sep = '\0' if getattr(self.opts, 'using_null', False) else '\n'
-        for line in out:
-            sys.stdout.write(line + sep)
-        sys.stdout.flush()
-
-    def _emit_viewer_output(self):
-        if not getattr(self.opts, 'stdout', False):
-            return
-        sep = '\0' if getattr(self.opts, 'using_null', False) else '\n'
-        marked = [f for f in self.files if f.flags & FF_MARK]
-        if not marked and 0 <= self.fileidx < len(self.files):
-            marked = [self.files[self.fileidx]]
         for f in marked:
-            sys.stdout.write(f.name + sep)
+            sys.stdout.write((f.label if use_labels else f.path) + sep)
         sys.stdout.flush()
 
     def quit(self, status=0):
@@ -2317,12 +2337,12 @@ class TkivApp:
         self._quitting = True
         self._scan_cancel = True
         try:
-            if self.purpose == 'select':
-                if status == 0:
-                    self._emit_selector_output()
-            else:
-                if status == 0:
-                    self._emit_viewer_output()
+            if status == 0:
+                if self.purpose == 'select':
+                    self._emit_output(
+                        getattr(self.opts, 'return_label', False))
+                elif getattr(self.opts, 'stdout', False):
+                    self._emit_output(False)
         except Exception:
             pass
         for exc in (self._img_executor, self._thumb_executor):
@@ -2422,7 +2442,7 @@ class TkivApp:
             self._enter_gallery_mode()
 
     def _key_escape(self):
-        if self._filter_text:
+        if self._filter_text and not self.no_searchbar:
             self.search_var.set("")
         else:
             self.quit(1 if self.purpose == 'select' else 0)
@@ -2459,7 +2479,8 @@ class TkivApp:
             self._show_content()
             if self.files:
                 self.load_image_async(self.fileidx)
-        self.search_entry.focus_set()
+        if not self.no_searchbar:
+            self.search_entry.focus_set()
 
     def _enter_gallery_mode(self):
         was = self.mode
@@ -2474,7 +2495,8 @@ class TkivApp:
             self.win_w = max(1, self.content.winfo_width())
             self.win_h = max(1, self.content.winfo_height())
         self.redraw()
-        self.search_entry.focus_set()
+        if not self.no_searchbar:
+            self.search_entry.focus_set()
 
     def _enter_list_mode(self):
         was = self.mode
@@ -2489,7 +2511,8 @@ class TkivApp:
             self.win_h = max(1, self.content.winfo_height())
         self._populate_listbox()
         self.redraw()
-        self.search_entry.focus_set()
+        if not self.no_searchbar:
+            self.search_entry.focus_set()
 
     # ---------------------------------------------------------- actions
     def act_first(self):
@@ -2507,11 +2530,7 @@ class TkivApp:
 
     def act_toggle_bar(self):
         self.show_bar = not self.show_bar
-        if self.show_bar:
-            self.status.pack(side=BOTTOM, fill=X,
-                             before=self.search_entry)
-        else:
-            self.status.pack_forget()
+        self._relayout_bars()
         self.root.after(50, self._refresh_size)
 
     def _refresh_size(self):
@@ -2537,21 +2556,14 @@ class TkivApp:
     def act_remove(self):
         if not self.files:
             return
-
-        # If any files are marked, remove all of them; otherwise just the
-        # current one.  Delete from highest index to lowest so that indices
-        # of files still to be removed are not shifted underneath us.
         marked_indices = [i for i, f in enumerate(self.files) if f.flags & FF_MARK]
         if not marked_indices:
             marked_indices = [self.fileidx]
 
         for i in sorted(marked_indices, reverse=True):
             if not self.remove_file(i, True):
-                # remove_file triggered quit() (e.g. last file removed).
                 return
 
-        # remove_file() already adjusted fileidx for each deletion, but clamp
-        # defensively in case the current file was among those removed.
         if self.fileidx >= len(self.files):
             self.fileidx = len(self.files) - 1
         if self.fileidx < 0:
@@ -2757,7 +2769,6 @@ class TkivApp:
                 n = self._gallery_hit(event.x, event.y)
                 if n is not None:
                     if self.purpose == 'select':
-                        # Single-click selects in gallery; use Ctrl-click to toggle mark
                         ctrl = bool(event.state & 0x0004)
                         if ctrl:
                             self._mark(n, not (self.files[n].flags & FF_MARK))
@@ -2805,14 +2816,7 @@ class TkivApp:
 
     def _do_resize(self):
         self._resize_pending = False
-        if self._quitting:
-            return
-        self.root.update_idletasks()
-        self.win_w = max(1, self.content.winfo_width())
-        self.win_h = max(1, self.content.winfo_height())
-        if self.mode == MODE_GALLERY:
-            self._pending_gallery_scroll = self.fileidx
-        self.redraw()
+        self._refresh_size()
 
     def _poll_autoreload(self):
         try:
@@ -2845,6 +2849,7 @@ def run_viewer():
         print("  Tab / Shift+Tab  cycle mode (image -> gallery -> list)")
         print("  Return           switch image <-> gallery (or list -> image)")
         print("  Esc              clear filter, or quit if empty")
+        print("  F2               toggle search bar / direct-key mode")
         print("  Ctrl+Q           quit")
         print("  Ctrl+F           fullscreen")
         print("  Ctrl+B           toggle bar")
@@ -2860,6 +2865,8 @@ def run_viewer():
         print("  Ctrl+E           fit width   Ctrl+W  fit-down")
         print("  Ctrl+Shift+W     fit         Ctrl+Shift+F  fill")
         print("  Ctrl+Y / Ctrl+Shift+Y  cycle sort / reverse sort")
+        print("\nDirect-key mode (--no-searchbar or F2): the search bar is")
+        print("hidden and every Ctrl+<key> action is rebound to plain <key>.")
         print("\nOptions:")
         print("  -g/-t, --gallery            start in gallery mode")
         print("  -T N,  --gallery-tile-size  gallery tile size in pixels")
@@ -2867,6 +2874,7 @@ def run_viewer():
         print("  --gallery-cols N            target cols visible")
         print("  --gallery-aspect N          tile width/height ratio "
               "(default: auto-detect)")
+        print("  --no-searchbar              start in direct-key mode")
         print("  --lazy                      populate file list as it is scanned")
         print("  --sort MODE                 initial sort: name, mtime, size, none")
         print("  -R, --sort-reverse          reverse the sort direction")
@@ -2899,15 +2907,11 @@ def run_viewer():
                 file_list.append(e)
     else:
         if args.lazy:
-            # expand directories later, lazily
             for f in args.files:
                 if os.path.isdir(f):
                     scan_paths.append(f)
                 else:
                     file_list.append(f)
-            if scan_paths:
-                # keep non-existent single paths? skip
-                pass
         else:
             for f in args.files:
                 if not os.path.exists(f):
@@ -2932,7 +2936,8 @@ def run_viewer():
         return 1
 
     entries = [FileEntry(p) for p in file_list]
-    app = TkivApp(root, args, entries, purpose='view',enable_floating_window=args.floating_window)
+    app = TkivApp(root, args, entries, purpose='view',
+                  enable_floating_window=args.floating_window)
     if args.lazy and scan_paths:
         app.start_lazy_scan(scan_paths, recursive=args.recursive,
                             sort_time=args.time)
@@ -2954,6 +2959,9 @@ def run_selector():
         print("Esc to cancel. Ctrl+M (or Ctrl+Enter) toggles a mark; when any")
         print("file is marked, all marked files are printed on accept.")
         print("Ctrl+Y / Ctrl+Shift+Y  cycle sort / reverse sort")
+        print("F2                     toggle search bar / direct-key mode")
+        print("\nDirect-key mode (--no-searchbar or F2): the search bar is")
+        print("hidden and every Ctrl+<key> action is rebound to plain <key>.")
         return 0
 
     if args.version:
@@ -2964,7 +2972,6 @@ def run_selector():
         sys.stderr.write(f"{PROGNAME}: warning: pyvips not available; "
                          "falling back to Pillow for image decoding.\n")
 
-    # --- Build entries list -------------------------------------------------
     entries = []
     scan_paths = []
 
@@ -3011,7 +3018,6 @@ def run_selector():
 
         entries = [FileEntry(path, label)
                    for label, path in zip(list_entries, image_entries)]
-        # dmenu entries may point at arbitrary paths — don't try to remove them
         args.assume_files = True
     else:
         paths = args.paths or ['.']
