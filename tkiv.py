@@ -917,10 +917,7 @@ class TkivApp:
         elif opts.list_mode :
             self.mode = MODE_LIST
         else :
-            if purpose == "view" :
                 self.mode = MODE_IMAGE
-            elif purpose == "select" :
-                self.mode = MODE_LIST
         self.markidx   = 0
         self.alternate = 0
         self._timeout_ids = {}
