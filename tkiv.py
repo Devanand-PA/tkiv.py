@@ -157,9 +157,9 @@ IMAGE_EXTS = {
 
 MAX_LOAD_DIM = 4096
 
-IMG_WORKERS         = 4
-THUMB_WORKERS       = 4
-PREFETCH_MAX        = 3
+IMG_WORKERS         = 8
+THUMB_WORKERS       = 8
+PREFETCH_MAX        = 8
 THUMB_MAX_IN_FLIGHT = 12
 QUEUE_POLL_MS       = 20
 FILTER_DEBOUNCE_MS  = 60
@@ -748,6 +748,11 @@ def _add_shared_ui_options(p, mode):
     p.add_argument('-g', '-t', '--gallery', '--thumbnail',
                    action='store_true', dest='thumb_mode',
                    help='start in gallery mode')
+
+    p.add_argument('-l', '--list-mode',
+                   action='store_true', dest='list_mode',
+                   help='start in list mode')
+
     p.add_argument('-T', '--gallery-tile-size', '--thumb-size',
                    type=int, default=None, dest='thumb_size',
                    help='gallery tile size in pixels')
@@ -907,7 +912,15 @@ class TkivApp:
         start = max(0, min(getattr(opts, 'start_at', 1) - 1,
                            max(0, len(self.files) - 1))) if self.files else 0
         self.fileidx   = start
-        self.mode      = MODE_GALLERY if opts.thumb_mode else MODE_IMAGE
+        if opts.thumb_mode :
+            self.mode = MODE_GALLERY
+        elif opts.list_mode :
+            self.mode = MODE_LIST
+        else :
+            if purpose == "view" :
+                self.mode = MODE_IMAGE
+            elif purpose == "select" :
+                self.mode = MODE_LIST
         self.markidx   = 0
         self.alternate = 0
         self._timeout_ids = {}
@@ -3197,6 +3210,7 @@ def run_viewer():
         print("  Any syntax error causes the whole config to be ignored.")
         print("\nOptions:")
         print("  -g/-t, --gallery            start in gallery mode")
+        print("  -l, --list-mode            start in list mode")
         print("  -T N,  --gallery-tile-size  gallery tile size in pixels")
         print("  --gallery-rows N            target rows visible")
         print("  --gallery-cols N            target cols visible")
