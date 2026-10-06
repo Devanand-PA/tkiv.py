@@ -1,0 +1,7 @@
+# tkiv Python dependencies
+# Required:
+Pillow>=10.0
+
+# Optional accelerated image decoding / thumbnail generation:
+# pyvips>=2.2
+# numpy>=1.24
