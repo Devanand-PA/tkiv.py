@@ -2632,11 +2632,11 @@ class TkivApp:
         try : 
             fsize = os.path.getsize(path)
             if fsize < 1024 :
-                size_str = f"{fsize} B"
+                size_str = f"{int(fsize * 100)/ 100} B"
             elif fsize < (1024 * 1024) :
-                size_str = f"{fsize / 1024} KB"
+                size_str = f"{int((fsize*100) / 1024)/100} KB"
             else :
-                size_str = f"{fsize / (1024 * 1024)} MB"
+                size_str = f"{int ((fsize*100) / (1024 * 1024)) / 100} MB"
         except OSError :
             size_str = "?"
 
