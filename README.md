@@ -1003,49 +1003,49 @@ selection and exits instead of switching visual modes.
 The configurable bindings are defined as action names internally. The
 defaults are:
 
-  Action             |   Default binding   |    Function
-  -------------------- --------------------- -----------------------------------
-  `quit`               `Ctrl+Q`              Quit
-  `toggle_bar`         `Ctrl+B`              Toggle status bar
-  `remove`             `Ctrl+D`              Remove current/marked entries
-  `fit_width`          `Ctrl+E`              Fit image width
-  `fullscreen`         `Ctrl+F`              Toggle fullscreen
-  `first`              `Ctrl+G`              First visible item
-  `pan_left`           `Ctrl+H`              Pan left
-  `toggle_antialias`   `Ctrl+I`              Toggle anti-aliasing
-  `pan_down`           `Ctrl+J`              Pan down
-  `pan_up`             `Ctrl+K`              Pan up
-  `pan_right`          `Ctrl+L`              Pan right
-  `toggle_mark`        `Ctrl+M`              Toggle current mark
-  `next`               `Ctrl+N`              Next visible item
-  `prev`               `Ctrl+P`              Previous visible item
-  `reload`             `Ctrl+R`              Reload current image/thumbnail
-  `slideshow`          `Ctrl+S`              Toggle slideshow
-  `unmark_all`         `Ctrl+U`              Clear all marks
-  `fit_down`           `Ctrl+W`              Fit down
-  `sort_cycle`         `Ctrl+Y`              Cycle sort mode/direction
-  `center`             `Ctrl+Z`              Center image
-  `animate`            `Ctrl+Space`          Toggle animation
-  `zoom_100`           `Ctrl+0`              Set 100% zoom
-  `zoom_in`            `Ctrl+Plus`           Zoom in / enlarge gallery tiles
-  `zoom_out`           `Ctrl+Minus`          Zoom out / shrink gallery tiles
-  `nav_10_forward`     `Ctrl+BracketRight`   Move 10 items forward
-  `nav_10_back`        `Ctrl+BracketLeft`    Move 10 items backward
-  `gamma_down`         `Ctrl+BraceLeft`      Lower gamma
-  `gamma_up`           `Ctrl+BraceRight`     Raise gamma
-  `contrast_down`      `Ctrl+ParenLeft`      Lower contrast
-  `contrast_up`        `Ctrl+ParenRight`     Raise contrast
-  `rotate_left`        `Ctrl+Less`           Rotate 90° counter-clockwise
-  `rotate_right`       `Ctrl+Greater`        Rotate 90° clockwise
-  `rotate_180`         `Ctrl+Question`       Rotate 180°
-  `flip_h`             `Ctrl+Bar`            Flip horizontally
-  `flip_v`             `Ctrl+Underscore`     Flip vertically
-  `fit`                `Ctrl+Shift+W`        Fit
-  `fill`               `Ctrl+Shift+F`        Fill
-  `fit_height`         `Ctrl+Shift+E`        Fit image height
-  `toggle_alpha`       `Ctrl+Shift+I`        Toggle alpha state
-  `sort_reverse`       `Ctrl+Shift+Y`        Reverse current sorting
-  `toggle_searchbar`   `F2`                  Toggle search bar/direct-key mode
+| Action | Default binding | Function |
+|---|---|---|
+| `quit` | `Ctrl+Q` | Quit |
+| `toggle_bar` | `Ctrl+B` | Toggle status bar |
+| `remove` | `Ctrl+D` | Remove current/marked entries |
+| `fit_width` | `Ctrl+E` | Fit image width |
+| `fullscreen` | `Ctrl+F` | Toggle fullscreen |
+| `first` | `Ctrl+G` | First visible item |
+| `pan_left` | `Ctrl+H` | Pan left |
+| `toggle_antialias` | `Ctrl+I` | Toggle anti-aliasing |
+| `pan_down` | `Ctrl+J` | Pan down |
+| `pan_up` | `Ctrl+K` | Pan up |
+| `pan_right` | `Ctrl+L` | Pan right |
+| `toggle_mark` | `Ctrl+M` | Toggle current mark |
+| `next` | `Ctrl+N` | Next visible item |
+| `prev` | `Ctrl+P` | Previous visible item |
+| `reload` | `Ctrl+R` | Reload current image/thumbnail |
+| `slideshow` | `Ctrl+S` | Toggle slideshow |
+| `unmark_all` | `Ctrl+U` | Clear all marks |
+| `fit_down` | `Ctrl+W` | Fit down |
+| `sort_cycle` | `Ctrl+Y` | Cycle sort mode/direction |
+| `center` | `Ctrl+Z` | Center image |
+| `animate` | `Ctrl+Space` | Toggle animation |
+| `zoom_100` | `Ctrl+0` | Set 100% zoom |
+| `zoom_in` | `Ctrl+Plus` | Zoom in / enlarge gallery tiles |
+| `zoom_out` | `Ctrl+Minus` | Zoom out / shrink gallery tiles |
+| `nav_10_forward` | `Ctrl+BracketRight` | Move 10 items forward |
+| `nav_10_back` | `Ctrl+BracketLeft` | Move 10 items backward |
+| `gamma_down` | `Ctrl+BraceLeft` | Lower gamma |
+| `gamma_up` | `Ctrl+BraceRight` | Raise gamma |
+| `contrast_down` | `Ctrl+ParenLeft` | Lower contrast |
+| `contrast_up` | `Ctrl+ParenRight` | Raise contrast |
+| `rotate_left` | `Ctrl+Less` | Rotate 90° counter-clockwise |
+| `rotate_right` | `Ctrl+Greater` | Rotate 90° clockwise |
+| `rotate_180` | `Ctrl+Question` | Rotate 180° |
+| `flip_h` | `Ctrl+Bar` | Flip horizontally |
+| `flip_v` | `Ctrl+Underscore` | Flip vertically |
+| `fit` | `Ctrl+Shift+W` | Fit |
+| `fill` | `Ctrl+Shift+F` | Fill |
+| `fit_height` | `Ctrl+Shift+E` | Fit image height |
+| `toggle_alpha` | `Ctrl+Shift+I` | Toggle alpha state |
+| `sort_reverse` | `Ctrl+Shift+Y` | Reverse current sorting |
+| `toggle_searchbar` | `F2` | Toggle search bar/direct-key mode |
 
 There is also a hard-coded:
 
@@ -1062,22 +1062,22 @@ binding for toggling the current mark while the search bar is visible.
 These bindings are installed separately from the configurable action
 table:
 
-  Key           Behavior
-  ------------- --------------------------------------
-  `Up`          Context-dependent navigation/pan
-  `Down`        Context-dependent navigation/pan
-  `Left`        Context-dependent navigation/pan
-  `Right`       Context-dependent navigation/pan
-  `PageUp`      Page backward
-  `PageDown`    Page forward
-  `Home`        First visible item
-  `End`         Last visible item
-  `Tab`         Next mode
-  `Shift+Tab`   Previous mode
-  `Return`      Accept/switch mode depending on mode
-  `KP_Enter`    Same as Return
-  `Escape`      Clear filter or quit
-  `Delete`      Remove current/marked files
+| Key | Behavior |
+|---|---|
+| `Up` | Context-dependent navigation/pan |
+| `Down` | Context-dependent navigation/pan |
+| `Left` | Context-dependent navigation/pan |
+| `Right` | Context-dependent navigation/pan |
+| `PageUp` | Page backward |
+| `PageDown` | Page forward |
+| `Home` | First visible item |
+| `End` | Last visible item |
+| `Tab` | Next mode |
+| `Shift+Tab` | Previous mode |
+| `Return` | Accept/switch mode depending on mode |
+| `KP_Enter` | Same as Return |
+| `Escape` | Clear filter or quit |
+| `Delete` | Remove current/marked files |
 
 These are not entries in `[keys]` and cannot be remapped through the
 configuration file.
