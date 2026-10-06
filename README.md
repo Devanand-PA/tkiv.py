@@ -861,7 +861,7 @@ In direct-key mode:
 -   Shift is retained where applicable;
 -   navigation keys remain unchanged.
 
-`F2` switches between the two modes at runtime.
+`Ctrl+Shift+S` switches between the two modes at runtime.
 
 ## `-q`, `--quiet`
 
@@ -991,7 +991,7 @@ Displays:
   `Shift+Tab`   Reverse cycle
   `Return`      Image → gallery; gallery/list → image
   `Esc`         Clear search, otherwise quit
-  `F2`          Search-bar/direct-key toggle
+  `Ctrl+Shift+S`          Search-bar/direct-key toggle
 
 In selector mode, `Return` has a different meaning: it accepts the
 selection and exits instead of switching visual modes.
@@ -1045,7 +1045,7 @@ defaults are:
 | `fit_height` | `Ctrl+Shift+E` | Fit image height |
 | `toggle_alpha` | `Ctrl+Shift+I` | Toggle alpha state |
 | `sort_reverse` | `Ctrl+Shift+Y` | Reverse current sorting |
-| `toggle_searchbar` | `F2` | Toggle search bar/direct-key mode |
+| `toggle_searchbar` | `Ctrl+Shift+S` | Toggle search bar/direct-key mode |
 
 There is also a hard-coded:
 
@@ -1973,7 +1973,7 @@ Ctrl+N
 Ctrl+Shift+W
 Alt+X
 Meta+Q
-F2
+Ctrl+Shift+S
 Space
 Return
 Escape
@@ -2754,7 +2754,7 @@ Q       quit
 F       fullscreen
 ```
 
-`F2` returns to the search-bar interface.
+`Ctrl+Shift+S` returns to the search-bar interface.
 
 ------------------------------------------------------------------------
 
@@ -2869,7 +2869,7 @@ tkiv select PATH...
 Tab             next mode
 Shift+Tab       previous mode
 Return          switch image/gallery/list
-F2              search/direct-key mode
+Ctrl+Shift+S              search/direct-key mode
 ```
 
 ## Navigation

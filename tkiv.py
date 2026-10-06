@@ -41,13 +41,13 @@ use Ctrl+):
     Ctrl+Y        cycle sort (name / date / size)
     Ctrl+Shift+Y  reverse sort direction
 
-    F2           toggle search bar / direct-key mode (no Ctrl needed)
+    Ctrl+Shift+S           toggle search bar / direct-key mode (no Ctrl needed)
 
-Direct-key mode (--no-searchbar / F2):
+Direct-key mode (--no-searchbar / Ctrl+Shift+S):
     Hides the search bar and rebinds every Ctrl+<key> action to the plain
     <key> (and Shift+Ctrl+<key> to Shift+<key>).  Navigation keys
     (arrows, Tab, Return, Esc, Delete, PageUp/Down, Home/End) behave the
-    same as always.  F2 switches back.
+    same as always.  Ctrl+Shift+S switches back.
 
 Configuration file:
     ~/.config/tkiv.py/config  (or $XDG_CONFIG_HOME/tkiv.py/config)
@@ -247,7 +247,7 @@ DEFAULT_KEYS = {
     'fit_height':       ['Ctrl+Shift+E'],
     'toggle_alpha':     ['Ctrl+Shift+I'],
     'sort_reverse':     ['Ctrl+Shift+Y'],
-    'toggle_searchbar': ['F2'],
+    'toggle_searchbar': ['Ctrl+Shift+S'],
 }
 
 # Behaviour values exposed in the config file.  Anything not listed here
@@ -359,7 +359,15 @@ def _parse_key_spec(spec):
         # Single character (letter or digit).  Tk treats these as
         # case-insensitive when a Shift modifier is present, so we
         # normalise letters to lowercase.
-        key_name = key.lower() if key.isalpha() else key
+        if key.isalpha() :
+            if 'Shift' in mods :
+                key_name = key.upper()
+            else :
+                key_name = key.lower()
+        else :
+            key_name = key
+
+
     else:
         return None
     return '<' + ''.join(m + '-' for m in mods) + key_name + '>'
@@ -791,7 +799,7 @@ def _add_shared_ui_options(p, mode):
     p.add_argument('--no-searchbar', '--no-search', '--direct-keys',
                    action='store_true', dest='no_searchbar',
                    help='hide the search bar and use plain key bindings '
-                        'without the Ctrl modifier (toggle at runtime with F2)')
+                        'without the Ctrl modifier (toggle at runtime with Ctrl+Shift+S)')
     p.add_argument('-q', '--quiet', action='store_true')
     p.add_argument('-v', '--version', action='store_true')
     p.add_argument('-h', '--help', action='store_true')
@@ -3209,7 +3217,7 @@ def run_viewer():
         print("  Tab / Shift+Tab  cycle mode (image -> gallery -> list)")
         print("  Return           switch image <-> gallery (or list -> image)")
         print("  Esc              clear filter, or quit if empty")
-        print("  F2               toggle search bar / direct-key mode")
+        print("  Ctrl+Shift+S               toggle search bar / direct-key mode")
         print("  Ctrl+Q           quit")
         print("  Ctrl+F           fullscreen")
         print("  Ctrl+B           toggle bar")
@@ -3225,7 +3233,7 @@ def run_viewer():
         print("  Ctrl+E           fit width   Ctrl+W  fit-down")
         print("  Ctrl+Shift+W     fit         Ctrl+Shift+F  fill")
         print("  Ctrl+Y / Ctrl+Shift+Y  cycle sort / reverse sort")
-        print("\nDirect-key mode (--no-searchbar or F2): the search bar is")
+        print("\nDirect-key mode (--no-searchbar or Ctrl+Shift+S): the search bar is")
         print("hidden and every Ctrl+<key> action is rebound to plain <key>.")
         print("\nConfig file: ~/.config/tkiv.py/config  "
               "(or $XDG_CONFIG_HOME/tkiv.py/config)")
@@ -3330,8 +3338,8 @@ def run_selector():
         print("Esc to cancel. Ctrl+M (or Ctrl+Enter) toggles a mark; when any")
         print("file is marked, all marked files are printed on accept.")
         print("Ctrl+Y / Ctrl+Shift+Y  cycle sort / reverse sort")
-        print("F2                     toggle search bar / direct-key mode")
-        print("\nDirect-key mode (--no-searchbar or F2): the search bar is")
+        print("Ctrl+Shift+S                     toggle search bar / direct-key mode")
+        print("\nDirect-key mode (--no-searchbar or Ctrl+Shift+S): the search bar is")
         print("hidden and every Ctrl+<key> action is rebound to plain <key>.")
         print("\nConfig file: ~/.config/tkiv.py/config  "
               "(or $XDG_CONFIG_HOME/tkiv.py/config)")
