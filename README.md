@@ -1003,7 +1003,7 @@ selection and exits instead of switching visual modes.
 The configurable bindings are defined as action names internally. The
 defaults are:
 
-  Action               Default binding       Function
+  Action             |   Default binding   |    Function
   -------------------- --------------------- -----------------------------------
   `quit`               `Ctrl+Q`              Quit
   `toggle_bar`         `Ctrl+B`              Toggle status bar
