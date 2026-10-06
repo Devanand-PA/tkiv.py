@@ -157,10 +157,10 @@ IMAGE_EXTS = {
 
 MAX_LOAD_DIM = 4096
 
-IMG_WORKERS         = 8
-THUMB_WORKERS       = 8
-PREFETCH_MAX        = 8
-THUMB_MAX_IN_FLIGHT = 12
+IMG_WORKERS         = 20
+THUMB_WORKERS       = 20
+PREFETCH_MAX        = 20
+THUMB_MAX_IN_FLIGHT = 20
 QUEUE_POLL_MS       = 20
 FILTER_DEBOUNCE_MS  = 60
 
@@ -1150,6 +1150,11 @@ class TkivApp:
         self.status = tk.Label(self.root, text='', anchor='w',
                                bg=self.bg, fg=self.fg,
                                font=self.bar_font, padx=8, pady=2)
+        
+        self.status2 = tk.Label(self.root, text='', anchor='e',
+                               bg=self.bg, fg=self.fg,
+                               font=self.bar_font, padx=8, pady=2)
+        
 
         self.search_var = StringVar()
         self.search_var.trace_add('write', self._on_search_change)
@@ -1176,11 +1181,13 @@ class TkivApp:
         """(Re)pack the content frame, status bar, and search bar."""
         self.content.pack_forget()
         self.status.pack_forget()
+        self.status2.pack_forget()
         self.search_entry.pack_forget()
 
         self.content.pack(side=TOP, fill=BOTH, expand=True)
         if self.show_bar:
             self.status.pack(side=BOTTOM, fill=X)
+            self.status2.pack(side=BOTTOM, fill=X)
         if not self.no_searchbar:
             self.search_entry.pack(**self._search_pack_opts)
 
@@ -2604,9 +2611,11 @@ class TkivApp:
     def update_info(self):
         if not self.show_bar:
             return
+        path = self.files[self.fileidx].path
         cnt_all = len(self.files)
         if cnt_all == 0:
             self.status.config(text='')
+            self.status2.config(text='')
             return
         cnt_vis = len(self._visible_indices)
         fw = len(str(cnt_all))
@@ -2619,6 +2628,26 @@ class TkivApp:
 
         sl = self._sort_label()
         suffix = f"  [{sl}]" if sl else ""
+
+        try : 
+            fsize = os.path.getsize(path)
+            if fsize < 1024 :
+                size_str = f"{fsize} B"
+            elif fsize < (1024 * 1024) :
+                size_str = f"{fsize / 1024} KB"
+            else :
+                size_str = f"{fsize / (1024 * 1024)} MB"
+        except OSError :
+            size_str = "?"
+
+        res_w , res_h = self._orig_sizes.get(path, (0,0) )
+        if res_w == 0 :
+            res_w , res_h = _get_orig_size(path)
+            if res_w > 0 :
+                self._orig_sizes[path] = (res_w,res_h)
+
+        res_str = f"{res_w}x{res_h}" if res_w > 0 else "?x?"
+
 
         if self.mode == MODE_GALLERY or self.mode == MODE_LIST:
             if self._filter_text:
@@ -2637,6 +2666,8 @@ class TkivApp:
             parts.append(f"{int(self.zoom * 100)}%")
             if len(self.img_frames) > 1:
                 parts.append(f"{self.img_sel + 1}/{len(self.img_frames)}")
+
+
             if self._filter_text:
                 parts.append(f"{vis_pos}/{cnt_vis} ({cnt_all})")
             else:
@@ -2644,6 +2675,7 @@ class TkivApp:
             if sl:
                 parts.append(sl)
             text = f"{mark}{'  '.join(parts)}  {name}"
+        self.status2.config(text=f" Resolution : {res_str} | File Size :{size_str}")
         self.status.config(text=text)
 
     # ---------------------------------------------------------- quit / output
