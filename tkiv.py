@@ -1185,6 +1185,7 @@ class TkivApp:
         self.win_h = max(1, self.content.winfo_height())
 
         self.tk_img = None
+        self._image_menu = None
 
     def _relayout_bars(self):
         """(Re)pack the content frame, status bar, and search bar."""
@@ -1232,6 +1233,14 @@ class TkivApp:
                              lambda ev, btn=b: self.on_button(ev, btn))
             self.gallery_canvas.bind(f'<ButtonPress-{b}>',
                                      lambda ev, btn=b: self.on_button(ev, btn))
+
+            self.listbox.bind(f'<ButtonPress-{b}>',
+                                     lambda ev, btn=b: self.on_button(ev, btn))
+            self.list_preview.bind(f'<ButtonPress-{b}>',
+                          lambda ev, btn=b: self.on_button(ev, btn))
+
+            self.list_filename.bind(f'<ButtonPress-{b}>',
+                          lambda ev, btn=b: self.on_button(ev, btn))
 
         self.canvas.bind('<Configure>', self.on_configure)
         self.gallery_canvas.bind('<Configure>', self.on_configure, add='+')
@@ -3119,6 +3128,90 @@ class TkivApp:
         self._nav_visible(d)
 
     # ---------------------------------------------------------- mouse
+    def _copy_image_to_clipboard(self) :
+        import io, platform , subprocess , tempfile
+
+        if not self.files or not (0 <= self.fileidx < len(self.files)):
+            return
+
+
+        if (self.mode != MODE_IMAGE) or (not self.img_frames):
+            try:
+                frames, _ = load_frames(
+                    self.files[self.fileidx].path,
+                    max_dim=self._max_load_dim)
+                if not frames:
+                    return
+                img = frames[0].copy()
+            except Exception as e:
+                if not getattr(self.opts, 'quiet', False):
+                    sys.stderr.write(
+                        f"{PROGNAME}: clipboard copy failed: {e}\n")
+                return
+        else:
+            img = self.img_frames[self.img_sel].copy()
+
+
+        buf = io.BytesIO()
+        img.save(buf,format='PNG')
+        png_data = buf.getvalue()
+        system = platform.system()
+
+        try :
+            if system == 'Linux' :
+                for cmd in (
+                        ['wl-copy','--type','image/png'],
+                        ['xclip','-sel','clip','-t','image/png']
+                        ) :
+                    try :
+                        subprocess.run(cmd,input=png_data,
+                                       check=True,timeout=5)
+                        return
+                    except : 
+                        continue
+                raise FileNotFoundError("neither wl-copy not xclip were found")
+            elif system == 'Darwin':
+                with tempfile.NamedTemporaryFile(suffix='.png',
+                                                 delete=False) as f:
+                    f.write(png_data)
+                    tmp = f.name
+                try:
+                    subprocess.run(
+                        ['osascript', '-e',
+                         f'set the clipboard to '
+                         f'(read (POSIX file "{tmp}") as «class PNGf»)'],
+                        check=True, timeout=5)
+                finally:
+                    os.unlink(tmp)
+
+            # elif system == 'Windows':
+            #     self._copy_png_to_clipboard_win32(img)
+
+            else:
+                raise OSError(f"unsupported platform: {system}")
+        except Exception as e :
+            if not getattr(self.opts,'quiet',False) :
+                sys.stderr.write(f"{PROGNAME} : clipboard copy failed : {e}\n")
+
+    
+    def _show_image_context_menu(self,event) :
+        if self._image_menu is None :
+            self._image_menu = tk.Menu(
+                    self.root,
+                    tearoff=0,
+                    bg=THEME['bg_secondary'],
+                    fg=THEME['fg_text'],
+                    activebackground=THEME['selected_bg'],
+                    activeforeground=THEME['selected_fg'],
+                    borderwidth=0
+                    )
+            self._image_menu.add_command(
+                    label="Copy",
+                    command=self._copy_image_to_clipboard
+                    )
+        self._image_menu.tk_popup(event.x_root, event.y_root)
+
+
     def on_button(self, event, button):
         if self.mode == MODE_IMAGE:
             if button == 1:
@@ -3128,7 +3221,7 @@ class TkivApp:
                 elif event.x > self.win_w - nw:
                     self.act_navigate(1)
             elif button == 3:
-                self._enter_gallery_mode()
+                self._show_image_context_menu(event)
             elif button == 4:
                 self.act_zoom(1)
             elif button == 5:
@@ -3155,8 +3248,8 @@ class TkivApp:
             elif button == 3:
                 n = self._gallery_hit(event.x, event.y)
                 if n is not None:
-                    self._mark(n, not (self.files[n].flags & FF_MARK))
-                    self.redraw()
+                    self.fileidx = n
+                    self._show_image_context_menu(event)
             elif button == 4:
                 self._gallery_scroll_by(-max(self._tile_h // 2, 30))
             elif button == 5:
@@ -3169,12 +3262,14 @@ class TkivApp:
                     self.listbox.select_set(sel)
                     self._on_listbox_select()
             elif button == 3:
-                sel = self.listbox.nearest(event.y)
-                if 0 <= sel < len(self._visible_indices):
-                    idx = self._visible_indices[sel]
-                    self._mark(idx, not (self.files[idx].flags & FF_MARK))
-                    self._populate_listbox()
-                    self.redraw()
+
+                if event.widget is self.listbox:
+                    sel = self.listbox.nearest(event.y)
+                    if 0 <= sel < len(self._visible_indices):
+                        self.fileidx = self._visible_indices[sel]
+                        self._persist_index()
+                # preview / filename: self.fileidx is already correct
+                self._show_image_context_menu(event)
 
     def on_configure(self, event):
         self.win_w = max(1, event.width)
