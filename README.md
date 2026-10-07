@@ -2,7 +2,11 @@
 
 A slightly bloated image viewer and dmenu alternative written in python.
 
-<https://github.com/user-attachments/assets/812fb912-bd25-425a-804d-cdbec0fe7d8b>
+
+
+https://github.com/user-attachments/assets/6e95efa3-4f56-456d-87a9-91436c46b5c1
+
+
 
 
 
