@@ -1328,7 +1328,7 @@ The removal only affects the current `tkiv` session.
   ----------------------------- --------------------
   Left click near left third    Previous image
   Left click near right third   Next image
-  Right click                   Enter gallery mode
+  Right click                   Open context menu
   Wheel up                      Zoom in
   Wheel down                    Zoom out
 
@@ -1339,7 +1339,7 @@ The center portion of the image does not use left-click navigation.
   Mouse action   Function
   -------------- -----------------
   Left click     Select image
-  Right click    Toggle mark
+  Right click    Open context menu
   Wheel up       Scroll upward
   Wheel down     Scroll downward
 
@@ -1351,7 +1351,7 @@ toggles its mark instead of simply moving to it.
   Mouse action   Function
   -------------- -------------
   Left click     Select item
-  Right click    Toggle mark
+  Right click    Open context menu
 
 ------------------------------------------------------------------------
 
