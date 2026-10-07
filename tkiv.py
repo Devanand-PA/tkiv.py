@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+some random shit
 """
 tkiv — combined image viewer (nsxiv-like) and image selector (dmenu-like)
 in a single program.
